@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoverl"
+version = "0.1.0"
+description = "A smaller, research-oriented RL core inspired by verl."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "nanoverl contributors" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+train = [
+  "torch>=2.1",
+  "ray>=2.9",
+  "PyYAML>=6.0",
+]
+dev = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+nanoverl-train = "nanoverl.cli.train_rl:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanoverl*"]
