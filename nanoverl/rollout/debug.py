@@ -17,12 +17,20 @@ class DebugRolloutEngine(RolloutEngine):
 
     @staticmethod
     def _tokenize_text(text: str) -> List[int]:
+        # 这里模拟了真实的文本 tokenization 过程，将输入文本拆分成单词（或 token），并为每个 token 分配一个唯一的整数 ID。
         pieces = [piece for piece in text.strip().split() if piece]
         if not pieces:
             return []
         return list(range(1, len(pieces) + 1))
 
     def generate(self, batch: RLBatch, sampling: SamplingParams) -> RLBatch:
+        """
+        Function:
+            - 从批次中的每一行数据提取提示文本和相关元数据，根据这些信息生成一个响应文本。
+            - 将提示文本和响应文本转换为整数 token 列表，模拟文本的 tokenization 过程。
+            - 生成一个与响应长度相同的 logprobs 列表，模拟模型在生成响应时的 logprobs 输出。
+            - 将生成的 prompts、responses、response_masks、attention_masks 和 rollout_log_probs 组织成一个新的 RLBatch，并将其与原始批次合并返回。
+        """
         del sampling
         prompts: List[List[int]] = []
         responses: List[List[int]] = []
@@ -35,14 +43,17 @@ class DebugRolloutEngine(RolloutEngine):
             row = batch.row(index)
             prompt_text = str(row.get("prompt_text") or row.get("prompt") or "")
             rollout_index = int(row.get("rollout_index", 0))
-            scripted = row.get("scripted_responses")
+            scripted = row.get("scripted_responses") # scipted 意思是预先定义好的响应列表，可能是为了测试不同版本的响应或者模拟模型在不同采样版本下的输出。
+            # 这里的逻辑是：如果 scripted_responses 存在且是一个非空列表，就根据 rollout_index 从中选择一个响应文本；
+            # 否则，如果 expected_response 存在，就使用它作为响应文本；
+            # 如果两者都不存在，则使用一个默认的调试响应文本 "debug-response"。
             if isinstance(scripted, list) and scripted:
                 response_text = str(scripted[min(rollout_index, len(scripted) - 1)])
             elif row.get("expected_response") is not None:
                 response_text = str(row["expected_response"])
             else:
                 response_text = "debug-response"
-            prompt_tokens = self._tokenize_text(prompt_text)
+            prompt_tokens = self._tokenize_text(prompt_text) # List[int]
             response_tokens = self._tokenize_text(response_text)[: self.max_response_length]
             prompts.append(prompt_tokens)
             responses.append(response_tokens)
@@ -54,8 +65,8 @@ class DebugRolloutEngine(RolloutEngine):
 
         update = RLBatch(
             batch={
-                "prompts": prompts,
-                "responses": responses,
+                "prompts": prompts, # List[List[int]]
+                "responses": responses, # List[List[int]]
                 "response_mask": response_masks,
                 "attention_mask": attention_masks,
                 "rollout_log_probs": rollout_log_probs,
