@@ -34,6 +34,7 @@ class DebugRolloutEngine(RolloutEngine):
         del sampling
         prompts: List[List[int]] = []
         responses: List[List[int]] = []
+        input_ids: List[List[int]] = []
         response_masks: List[List[int]] = []
         attention_masks: List[List[int]] = []
         rollout_log_probs: List[List[float]] = []
@@ -57,6 +58,7 @@ class DebugRolloutEngine(RolloutEngine):
             response_tokens = self._tokenize_text(response_text)[: self.max_response_length]
             prompts.append(prompt_tokens)
             responses.append(response_tokens)
+            input_ids.append(prompt_tokens + response_tokens)
             response_masks.append([1 for _ in response_tokens])
             attention_masks.append([1 for _ in range(len(prompt_tokens) + len(response_tokens))])
             base_logprob = -0.25 - (0.05 * rollout_index) - (0.01 * self.policy_version)
@@ -67,6 +69,7 @@ class DebugRolloutEngine(RolloutEngine):
             batch={
                 "prompts": prompts, # List[List[int]]
                 "responses": responses, # List[List[int]]
+                "input_ids": input_ids,
                 "response_mask": response_masks,
                 "attention_mask": attention_masks,
                 "rollout_log_probs": rollout_log_probs,

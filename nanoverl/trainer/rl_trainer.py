@@ -16,7 +16,7 @@ from nanoverl.data.dataset import JsonDataset, StatefulDataLoader
 from nanoverl.logging.metrics import compute_data_metrics, compute_throughput_metrics, compute_timing_metrics
 from nanoverl.logging.trackers import TrackingManager
 from nanoverl.reward import RewardManager, load_reward_function
-from nanoverl.rollout import DebugRolloutEngine, SamplingParams
+from nanoverl.rollout import DebugRolloutEngine, HFRolloutEngine, SamplingParams
 from nanoverl.trainer.validation import summarize_validation
 from nanoverl.workers import create_policy_worker, create_reference_worker, create_value_worker
 
@@ -53,13 +53,20 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
             drop_last=False,
         )
 
-    policy_worker = create_policy_worker(config.actor.backend, config.actor)
-    reference_worker = create_reference_worker(config.reference.backend, config.reference) if config.reference.enable else None
-    value_worker = create_value_worker(config.critic.backend, config.critic) if config.critic.enable else None
+    policy_worker = create_policy_worker(config.actor.backend, config.model, config.actor)
+    reference_worker = (
+        create_reference_worker(config.reference.backend, config.model, config.reference)
+        if config.reference.enable
+        else None
+    )
+    value_worker = create_value_worker(config.critic.backend, config.model, config.critic) if config.critic.enable else None
 
-    if config.rollout.backend != "debug":
-        raise ValueError("Only the built-in debug rollout engine is available in the current scaffold.")
-    rollout_engine = DebugRolloutEngine(max_response_length=config.rollout.response_length)
+    if config.rollout.backend == "debug":
+        rollout_engine = DebugRolloutEngine(max_response_length=config.rollout.response_length)
+    elif config.rollout.backend == "hf":
+        rollout_engine = HFRolloutEngine(config.model, config.data, config.rollout)
+    else:
+        raise ValueError("Unknown rollout backend: %s" % config.rollout.backend)
 
     reward_fn = load_reward_function(config.reward.function_path, config.reward.function_name)
     reward_manager = RewardManager(reward_fn)

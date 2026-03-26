@@ -1,0 +1,92 @@
+{
+  "data": {
+    "train_path": "examples/data/debug_prompts.jsonl",
+    "val_path": "examples/data/debug_prompts.jsonl",
+    "prompt_key": "prompt",
+    "train_batch_size": 2,
+    "val_batch_size": 2,
+    "shuffle": false,
+    "seed": 11,
+    "max_prompt_length": 256,
+    "max_response_length": 64
+  },
+  "model": {
+    "path": "path/to/local/hf-model",
+    "tokenizer_path": "path/to/local/hf-model",
+    "dtype": "float32"
+  },
+  "algorithm": {
+    "name": "ppo",
+    "advantage_estimator": "gae",
+    "gamma": 1.0,
+    "lam": 1.0,
+    "use_kl_in_reward": true,
+    "kl_penalty": "low_var_kl",
+    "kl_coef": 0.01
+  },
+  "actor": {
+    "backend": "hf",
+    "ppo_mini_batch_size": 2,
+    "ppo_epochs": 1,
+    "micro_batch_size": 1,
+    "clip_ratio": 0.2,
+    "use_kl_loss": false,
+    "lr": 1e-5,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0
+  },
+  "critic": {
+    "backend": "hf",
+    "enable": true,
+    "ppo_mini_batch_size": 2,
+    "ppo_epochs": 1,
+    "micro_batch_size": 1,
+    "cliprange_value": 0.5,
+    "lr": 1e-5,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0
+  },
+  "reference": {
+    "backend": "hf",
+    "enable": true
+  },
+  "rollout": {
+    "backend": "hf",
+    "response_length": 64,
+    "train": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "do_sample": true,
+      "n": 1
+    },
+    "validation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "do_sample": false,
+      "n": 1
+    }
+  },
+  "reward": {
+    "type": "python",
+    "function_name": "compute_reward"
+  },
+  "trainer": {
+    "total_epochs": 1,
+    "validate_before_train": true,
+    "validate_only": false,
+    "test_freq": 1,
+    "save_freq": 1,
+    "critic_warmup": 0,
+    "project_name": "nanoverl",
+    "experiment_name": "hf_local_ppo",
+    "default_local_dir": "checkpoints/hf_local_ppo",
+    "loggers": [
+      "console"
+    ]
+  },
+  "ray": {
+    "enabled": false
+  }
+}

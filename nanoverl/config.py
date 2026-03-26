@@ -84,8 +84,11 @@ class DataConfig:
 class ModelConfig:
     path: str = "debug-model"
     tokenizer_path: Optional[str] = None
+    critic_path: Optional[str] = None
     trust_remote_code: bool = False
     use_remove_padding: bool = True
+    dtype: str = "float32"
+    chat_template_path: Optional[str] = None
 
 
 @dataclass
@@ -114,6 +117,7 @@ class ActorConfig:
     backend: str = "debug"
     ppo_mini_batch_size: int = 2
     ppo_epochs: int = 1
+    micro_batch_size: Optional[int] = None
     clip_ratio: float = 0.2
     clip_ratio_low: Optional[float] = None
     clip_ratio_high: Optional[float] = None
@@ -123,6 +127,12 @@ class ActorConfig:
     kl_loss_coef: float = 0.001
     loss_agg_mode: str = "token-mean"
     update_step_size: float = 0.02
+    lr: float = 1e-5
+    weight_decay: float = 0.0
+    betas: Tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    max_grad_norm: float = 1.0
+    shuffle: bool = True
 
 
 @dataclass
@@ -131,8 +141,15 @@ class CriticConfig:
     enable: bool = True
     ppo_mini_batch_size: int = 2
     ppo_epochs: int = 1
+    micro_batch_size: Optional[int] = None
     cliprange_value: float = 0.5
     loss_agg_mode: str = "token-mean"
+    lr: float = 1e-5
+    weight_decay: float = 0.0
+    betas: Tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    max_grad_norm: float = 1.0
+    shuffle: bool = True
 
 
 @dataclass
@@ -233,8 +250,12 @@ class TrainerConfig:
             raise ConfigError("rollout.train.n must be positive.")
         if self.actor.ppo_mini_batch_size <= 0:
             raise ConfigError("actor.ppo_mini_batch_size must be positive.")
+        if self.actor.micro_batch_size is not None and self.actor.micro_batch_size <= 0:
+            raise ConfigError("actor.micro_batch_size must be positive when set.")
         if self.critic.enable and self.critic.ppo_mini_batch_size <= 0:
             raise ConfigError("critic.ppo_mini_batch_size must be positive when critic is enabled.")
+        if self.critic.enable and self.critic.micro_batch_size is not None and self.critic.micro_batch_size <= 0:
+            raise ConfigError("critic.micro_batch_size must be positive when set.")
         if self.algorithm.name == "grpo" and self.algorithm.advantage_estimator == "gae":
             self.algorithm.advantage_estimator = "grpo"
         if self.algorithm.advantage_estimator == "grpo" and self.rollout.train.n < 2:
@@ -243,6 +264,10 @@ class TrainerConfig:
             raise ConfigError("Reference worker must be enabled when KL-in-reward is enabled.")
         if self.actor.use_kl_loss and not self.reference.enable:
             raise ConfigError("Reference worker must be enabled when actor KL loss is enabled.")
+        if self.actor.backend == "hf" and self.rollout.backend != "hf":
+            raise ConfigError("actor.backend='hf' requires rollout.backend='hf'.")
+        if self.rollout.backend == "hf" and self.model.tokenizer_path is None:
+            self.model.tokenizer_path = self.model.path
         if self.ray.enabled and self.actor.backend == "debug":
             # This is intentionally permissive; debug workers still run locally.
             return
