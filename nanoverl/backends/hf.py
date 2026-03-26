@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
 
 class MissingDependencyError(RuntimeError):
     """Raised when an optional local HF backend dependency is unavailable."""
@@ -25,12 +26,11 @@ def require_hf_dependencies():
     return torch, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 
-def torch_dtype_from_string(dtype_name: str | None):
+def resolve_torch_dtype(dtype_name: Optional[str]):
     torch, _, _, _ = require_hf_dependencies()
     if dtype_name is None:
         return torch.float32
-    normalized = dtype_name.lower()
-    mapping = {
+    dtype_lookup = {
         "float32": torch.float32,
         "fp32": torch.float32,
         "float": torch.float32,
@@ -40,12 +40,13 @@ def torch_dtype_from_string(dtype_name: str | None):
         "bfloat16": torch.bfloat16,
         "bf16": torch.bfloat16,
     }
-    if normalized not in mapping:
+    normalized_name = dtype_name.lower()
+    if normalized_name not in dtype_lookup:
         raise ValueError("Unsupported model.dtype: %s" % dtype_name)
-    return mapping[normalized]
+    return dtype_lookup[normalized_name]
 
 
-def default_device():
+def get_default_device():
     torch, _, _, _ = require_hf_dependencies()
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -66,14 +67,15 @@ def load_tokenizer(model_config):
             tokenizer.pad_token = tokenizer.unk_token
         else:
             raise ValueError("Tokenizer must expose a pad_token, eos_token, or unk_token for local HF rollout.")
+    tokenizer.padding_side = "left"
     return tokenizer
 
 
 def load_causal_lm(model_config):
-    _, _, auto_model, _ = require_hf_dependencies()
-    return auto_model.from_pretrained(
+    _, _, auto_model_for_causal_lm, _ = require_hf_dependencies()
+    return auto_model_for_causal_lm.from_pretrained(
         model_config.path,
-        torch_dtype=torch_dtype_from_string(model_config.dtype),
+        dtype=resolve_torch_dtype(model_config.dtype),
         trust_remote_code=model_config.trust_remote_code,
     )
 
@@ -83,90 +85,68 @@ def load_backbone_model(model_config, path: Optional[str] = None):
     model_path = path or model_config.path
     return auto_model.from_pretrained(
         model_path,
-        torch_dtype=torch_dtype_from_string(model_config.dtype),
+        dtype=resolve_torch_dtype(model_config.dtype),
         trust_remote_code=model_config.trust_remote_code,
     )
 
 
-def ensure_prompt_tokens(prompt_tokens: Sequence[int], tokenizer) -> List[int]:
-    """
-    作用：确保提示令牌的有效性。如果提供了非空的提示令牌，则直接返回它们。
-    否则，尝试使用tokenizer的bos_token_id、eos_token_id或pad_token_id作为回退令牌。如果这些都不可用，则引发错误。
-    """
-    tokens = list(prompt_tokens)
-    if tokens:
-        return tokens
-    for token_id in (tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id):
-        if token_id is not None:
-            return [int(token_id)]
+def ensure_prompt_tokens(prompt_token_ids: Sequence[int], tokenizer) -> List[int]:
+    token_ids = list(prompt_token_ids)
+    if token_ids:
+        return token_ids
+    for fallback_token_id in (tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id):
+        if fallback_token_id is not None:
+            return [int(fallback_token_id)]
     raise ValueError("Prompt text is empty and tokenizer has no usable fallback token.")
 
 
-def truncate_prompt(prompt_tokens: Sequence[int], max_prompt_length: int) -> List[int]:
-    """
-    Function:
-        Truncate the prompt tokens to the specified maximum length. 
-        If the max_prompt_length is less than or equal to 0, return an empty list.
-    """
-    
-    tokens = list(prompt_tokens)
+def truncate_prompt(prompt_token_ids: Sequence[int], max_prompt_length: int) -> List[int]:
     if max_prompt_length <= 0:
         return []
-    # 提取列表中的最后 max_prompt_length 个元素。
-    # 这在处理 LLM 输入时很常见，用于确保 prompt 不会超过模型的最大上下文长度，通常保留最近（末尾）的 token。
-    # 如果 max_prompt_length 大于列表的总长度，Python 会自动将其视为从列表的起始位置（索引 0）开始截取。在这种情况下，会得到整个列表的副本。
-    return tokens[-max_prompt_length:]
+    return list(prompt_token_ids)[-max_prompt_length:]
 
 
-def truncate_response(response_tokens: Sequence[int], max_response_length: int) -> List[int]:
+def truncate_response(response_token_ids: Sequence[int], max_response_length: int) -> List[int]:
     if max_response_length <= 0:
         return []
-    return list(response_tokens[:max_response_length])
+    return list(response_token_ids[:max_response_length])
 
 
 def pack_prompt_response_tokens(
     tokenizer,
-    prompt_tokens: Sequence[int],
-    response_tokens: Sequence[int],
+    prompt_token_ids: Sequence[int],
+    response_token_ids: Sequence[int],
     max_prompt_length: int,
     max_response_length: int,
 ) -> Dict[str, List[int]]:
-    """
-    Function:
-        - 将提示和响应令牌打包成一个结构化的字典，包含截断后的提示、响应、输入 ID、注意力掩码和响应掩码
-    """
-    prompt = truncate_prompt(ensure_prompt_tokens(prompt_tokens, tokenizer), max_prompt_length)
-    response = truncate_response(response_tokens, max_response_length)
+    prompt_ids = truncate_prompt(ensure_prompt_tokens(prompt_token_ids, tokenizer), max_prompt_length)
+    response_ids = truncate_response(response_token_ids, max_response_length)
     return {
-        "prompts": prompt,
-        "responses": response,
-        "input_ids": prompt + response,
-        "attention_mask": [1] * (len(prompt) + len(response)),
-        "response_mask": [1] * len(response),
+        "prompts": prompt_ids,
+        "responses": response_ids,
+        "input_ids": prompt_ids + response_ids,
+        "attention_mask": [1] * (len(prompt_ids) + len(response_ids)),
+        "response_mask": [1] * len(response_ids),
     }
 
 
 def encode_text(tokenizer, text: str) -> List[int]:
-    """
-    Function:
-        str -> List[int]
-    """
     encoded = tokenizer(text, add_special_tokens=False)
     return list(encoded["input_ids"])
 
 
-def pad_rows(rows: Sequence[Sequence[Any]], pad_value: Any) -> List[List[Any]]:
-    """
-    Function:
-        使用最大长度度对行进行填充，使它们具有相同的长度。每行将被填充 pad_value 直到达到最大长度。
-    """
+def pad_rows(rows: Sequence[Sequence[Any]], pad_value: Any, padding_side: str = "right") -> List[List[Any]]:
     if not rows:
         return []
-    width = max(len(row) for row in rows)
-    # 如果 row 已经是 list，list(row) 的唯一作用是做了一次显式的浅拷贝，
-    # 但在包含 + 运算的推导式中，这个拷贝通常是多余的。
-    # 如果 row 可能是元组或其他不可变序列，list(row) 可以确保我们得到一个可变的列表来进行连接操作。
-    return [list(row) + [pad_value] * (width - len(row)) for row in rows]
+    if padding_side not in {"left", "right"}:
+        raise ValueError("padding_side must be 'left' or 'right'.")
+    max_row_length = max(len(row) for row in rows)
+    padded_rows: List[List[Any]] = []
+    for row in rows:
+        row_values = list(row)
+        padding = [pad_value] * (max_row_length - len(row_values))
+        padded_rows.append(padding + row_values if padding_side == "left" else row_values + padding)
+    return padded_rows
 
 
 def batch_lists_to_tensor(
@@ -174,113 +154,100 @@ def batch_lists_to_tensor(
     pad_value: Any,
     device,
     dtype=None,
-) -> torch.Tensor:
+    padding_side: str = "right",
+):
+    torch, _, _, _ = require_hf_dependencies()
+    padded_rows = pad_rows(rows, pad_value, padding_side=padding_side)
+    tensor_kwargs: Dict[str, Any] = {"device": device}
+    if dtype is not None:
+        tensor_kwargs["dtype"] = dtype
+    return torch.tensor(padded_rows, **tensor_kwargs)
+
+
+def get_prompt_lengths(batch) -> List[int]:
+    return [len(prompt_ids) for prompt_ids in batch.batch["prompts"]]
+
+
+def get_response_lengths(batch) -> List[int]:
+    # 语义等价于直接写成 [sum(response_mask) for response_mask in batch.batch["response_mask"]] 
+    # 但是采用了防御性编程的方式，确保即使response_mask中的元素不是int类型（例如bool类型），也能正确计算响应长度。
+    return [sum(int(token_mask) for token_mask in response_mask) for response_mask in batch.batch["response_mask"]]
+
+
+def build_training_tensors(batch, device):
     """
     Function:
-        - 将一批列表转换为 PyTorch 张量。首先使用 pad_rows 函数对列表进行(右)填充，使它们具有相同的长度，然后将填充后的列表转换为 PyTorch 张量。
-        - 可以指定填充值、设备和数据类型。
+        - 从batch中提取训练所需的各种张量，包括response_mask、old_log_probs、advantages、returns和ref_log_probs，并将它们转换为适当的PyTorch张量，准备好在训练过程中使用。
     """
     torch, _, _, _ = require_hf_dependencies()
-    padded = pad_rows(rows, pad_value)
-    kwargs: Dict[str, Any] = {"device": device}
-    if dtype is not None:
-        kwargs["dtype"] = dtype
-    return torch.tensor(padded, **kwargs)
-
-
-def response_lengths(batch) -> List[int]:
-    return [sum(int(mask) for mask in row) for row in batch.batch["response_mask"]]
-
-
-def prompt_lengths(batch) -> List[int]:
-    return [len(row) for row in batch.batch["prompts"]]
-
-
-def build_response_tensors(batch, device):
-    torch, _, _, _ = require_hf_dependencies()
-    mask = batch_lists_to_tensor(batch.batch["response_mask"], 0, device=device, dtype=torch.float32)
-    old_log_probs = batch_lists_to_tensor(batch.batch.get("old_log_probs", []), 0.0, device=device, dtype=torch.float32)
-    advantages = batch_lists_to_tensor(batch.batch.get("advantages", []), 0.0, device=device, dtype=torch.float32)
-    returns = batch_lists_to_tensor(batch.batch.get("returns", []), 0.0, device=device, dtype=torch.float32)
-    ref_log_probs = batch_lists_to_tensor(batch.batch.get("ref_log_probs", []), 0.0, device=device, dtype=torch.float32)
     return {
-        "response_mask": mask,
-        "old_log_probs": old_log_probs,
-        "advantages": advantages,
-        "returns": returns,
-        "ref_log_probs": ref_log_probs,
+        "response_mask": batch_lists_to_tensor(batch.batch["response_mask"], 0, device=device, dtype=torch.float32),
+        "old_log_probs": batch_lists_to_tensor(batch.batch.get("old_log_probs", []), 0.0, device=device, dtype=torch.float32),
+        "advantages": batch_lists_to_tensor(batch.batch.get("advantages", []), 0.0, device=device, dtype=torch.float32),
+        "returns": batch_lists_to_tensor(batch.batch.get("returns", []), 0.0, device=device, dtype=torch.float32),
+        "ref_log_probs": batch_lists_to_tensor(batch.batch.get("ref_log_probs", []), 0.0, device=device, dtype=torch.float32),
     }
 
 
 def extract_response_stats(
-    logits,
-    input_ids,
-    prompt_lens: Sequence[int],
-    response_lens: Sequence[int],
-):
+    logits, input_ids, prompt_token_counts: Sequence[int], response_token_counts: Sequence[int]
+    ) -> (torch.Tensor, torch.Tensor):
     """
-    Function:
-    - 从模型的输出 logits 和输入 input_ids 中提取与响应相关的统计信息，包括响应的对数概率和熵。
-    - 计算每个时间步的对数概率和熵，然后根据提示长度和响应长度将这些统计信息提取到单独的张量中，以便后续处理。
     Args:
-    - logits: 模型输出的原始 logits，形状为 (batch_size, sequence_length, vocab_size)。
-    - input_ids: 模型输入的 token ID，形状为 (batch_size, sequence_length)。
-    - prompt_lens: 每个样本的提示长度列表，表示每个样本中提示部分的 token 数量。
-    - response_lens: 每个样本的响应长度列表，表示每个样本中响应部分的 token 数量。
-    Returns:
-    - response_log_probs: 包含响应部分的对数概率的张量，形状为 (batch_size, max_response_length)，其中 max_response_length 是响应长度的最大值。
-    - response_entropy: 包含响应部分的熵的张量，形状为 (batch_size, max_response_length)，其中 max_response_length 是响应长度的最大值。
+        - logits: 完整一句话的logits，shape为 (batch_size, sequence_length, vocab_size)
+        - input_ids: 完整一句话的token ids，shape为 (batch_size, sequence_length)
+        - prompt_token_counts: 每个样本中prompt部分的token数量，shape为 (batch_size,)
+        - response_token_counts: 每个样本中response部分的token数量，shape为 (batch_size,)
+     Returns:
+        - response_log_probs: 每个样本中response部分的log_prob，shape为 (batch_size, max_response_length)，其中max_response_length是response_token_counts中的最大值
+        - response_entropy: 每个样本中response部分的token熵值，shape为 (batch_size, max_response_length)
     """
     torch, _, _, _ = require_hf_dependencies()
-    # logits[:, :-1, :] 的形状为 (batch_size, sequence_length - 1, vocab_size)，
-    # 因为在语言模型中，通常会将输入序列的最后一个 token 的 logits 排除在外，因为它没有对应的下一个 token 来计算概率。
-    log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1)
-    probs = torch.exp(log_probs)
-    entropy = -(probs * log_probs).sum(dim=-1) # 计算每个时间步的熵，形状为 (batch_size, sequence_length - 1)
-    targets = input_ids[:, 1:]
-    token_log_probs = torch.gather(log_probs, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1) # 计算每个时间步的对数概率，形状为 (batch_size, sequence_length - 1)
+    shifted_log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1) # 除了最后一个token之外的所有token的logits计算log_probs。shape为 (batch_size, sequence_length - 1, vocab_size)
+    shifted_probs = torch.exp(shifted_log_probs) # 得到概率分布
+    token_entropy = -(shifted_probs * shifted_log_probs).sum(dim=-1) # shape为 (batch_size, sequence_length - 1)，每个token的熵值
+    target_ids = input_ids[:, 1:] # 目标token是输入的token向右shift一个位置，shape为 (batch_size, sequence_length - 1)
+    target_log_probs = torch.gather(shifted_log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1) # 从shifted_log_probs中提取出目标token对应的log_prob，shape为 (batch_size, sequence_length - 1)
 
     batch_size = input_ids.shape[0]
-    max_response_len = max(response_lens, default=0)
-    # new_zeros 创建一个新的张量，形状为 (batch_size, max_response_len)，并用 0 填充。
-    # 这个新生成的张量会与调用它的张量（源张量）保持以下三个属性一致: 数据类型、设备和梯度跟踪状态。
-    response_log_probs = token_log_probs.new_zeros((batch_size, max_response_len))
-    response_entropy = entropy.new_zeros((batch_size, max_response_len))
+    max_response_length = max(response_token_counts, default=0)
+    response_log_probs = target_log_probs.new_zeros((batch_size, max_response_length))
+    response_entropy = token_entropy.new_zeros((batch_size, max_response_length))
 
-    for row_index, (prompt_len, response_len) in enumerate(zip(prompt_lens, response_lens)):
-        if response_len <= 0:
+    for row_index, (prompt_token_count, response_token_count) in enumerate(
+        zip(prompt_token_counts, response_token_counts)
+    ):
+        if response_token_count <= 0:
             continue
-        start = max(prompt_len - 1, 0)
-        end = start + response_len
-        response_log_probs[row_index, :response_len] = token_log_probs[row_index, start:end]
-        response_entropy[row_index, :response_len] = entropy[row_index, start:end]
+        response_start = max(prompt_token_count - 1, 0) # 指向 prompt 最后
+        response_stop = response_start + response_token_count
+        response_log_probs[row_index, :response_token_count] = target_log_probs[row_index, response_start:response_stop]
+        response_entropy[row_index, :response_token_count] = token_entropy[row_index, response_start:response_stop]
     return response_log_probs, response_entropy
 
 
 def tensor_to_list_rows(matrix, lengths: Sequence[int]) -> List[List[float]]:
+    """
+    Function:
+        将一个二维tensor转换为一个列表的列表，其中每个子列表的长度由对应的lengths指定。原本的 tensor每一行的长度都一样，但转换后的列表中每行的长度可能不同，取决于lengths中的值。
+    """
     rows: List[List[float]] = []
-    for row, length in zip(matrix.detach().cpu().tolist(), lengths):
-        rows.append([float(value) for value in row[:length]])
+    for row_values, valid_length in zip(matrix.detach().cpu().tolist(), lengths):
+        rows.append([float(value) for value in row_values[:valid_length]])
     return rows
 
 
-def count_valid_tokens(rows: Sequence[Sequence[int]]) -> int:
-    return sum(sum(int(value) for value in row) for row in rows)
+def count_valid_tokens(response_masks: Sequence[Sequence[int]]) -> int:
+    return sum(sum(int(token_mask) for token_mask in response_mask) for response_mask in response_masks)
 
 
-def aggregate_weight(batch, loss_agg_mode: str) -> float:
-    """
-    Function:
-        根据指定的 loss_agg_mode 聚合权重。支持两种模式：
-        - "token-mean": 返回批次中有效 token 的总数（即 response_mask 中值为 1 的数量）。这种模式适用于按 token 平均的损失计算。
-        - 其他模式: 返回批次中的样本数量。这种模式适用于按样本平均的损失计算。
-    """
+def get_loss_weight(batch, loss_agg_mode: str) -> float:
     if loss_agg_mode == "token-mean":
         return float(count_valid_tokens(batch.batch["response_mask"]))
     return float(len(batch))
 
 
-def mean_of_values(values: Sequence[float]) -> float:
+def average_or_zero(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     return float(sum(values) / len(values))
@@ -288,11 +255,10 @@ def mean_of_values(values: Sequence[float]) -> float:
 
 def clone_model_state(state: Mapping[str, Any]) -> Dict[str, Any]:
     torch, _, _, _ = require_hf_dependencies()
-    cloned: Dict[str, Any] = {}
+    cloned_state: Dict[str, Any] = {}
     for key, value in state.items():
         if isinstance(value, torch.Tensor):
-            cloned[key] = value.detach().cpu().clone()
+            cloned_state[key] = value.detach().cpu().clone()
         else:
-            cloned[key] = value
-    return cloned
-
+            cloned_state[key] = value
+    return cloned_state

@@ -1,6 +1,6 @@
 # Nanoverl Architecture
 
-`nanoverl` is now in late `Phase 1`: the debug scaffold remains intact, and the first local Hugging Face PPO path has been wired into the same trainer loop.
+`nanoverl` now has a complete local `Phase 1` path: the debug scaffold remains intact, and a real single-process Hugging Face PPO path runs through the same trainer loop, validation path, logging path, and checkpoint flow.
 
 ```mermaid
 flowchart LR
@@ -70,8 +70,9 @@ flowchart LR
 
 ## Recommended Next Extension
 
-Use the new local HF path to harden Phase 1 semantics first:
+Phase 1 is complete for the current local-workspace scope. The next extension should move into early `Phase 2`:
 
-- add stronger HF checkpoint and rollout-sync regression tests once dependencies are available in the workspace
+- add stronger HF regression coverage around checkpoint compatibility, rollout sync, and metric stability
 - improve config validation around HF batch sizing and tokenizer/model compatibility
-- then decide whether the next serious backend step is `FSDP` training or a thin reusable inference adapter such as `vLLM`
+- add GRPO usability polish and reward-plugin ergonomics on top of the now-stable PPO core
+- only then decide whether the next serious backend step is `FSDP` training or a thin inference adapter such as `vLLM`

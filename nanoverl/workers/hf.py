@@ -6,27 +6,25 @@ import random
 from typing import Any, Dict, List, Optional
 
 from nanoverl.backends.hf import (
-    aggregate_weight,
+    average_or_zero,
     batch_lists_to_tensor,
-    build_response_tensors,
+    build_training_tensors,
     clone_model_state,
-    default_device,
     extract_response_stats,
+    get_default_device,
+    get_loss_weight,
+    get_prompt_lengths,
+    get_response_lengths,
     load_backbone_model,
     load_causal_lm,
-    mean_of_values,
-    prompt_lengths,
     require_hf_dependencies,
-    response_lengths,
     tensor_to_list_rows,
 )
 from nanoverl.workers.base import LogProbResult, PolicyWorker, ReferenceWorker, UpdateResult, ValueResult, ValueWorker
 
 
 def _masked_mean(values, mask):
-    torch, _, _, _ = require_hf_dependencies()
-    denom = mask.sum().clamp_min(1.0)
-    return (values * mask).sum() / denom
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 def _aggregate_loss(loss_matrix, response_mask, loss_agg_mode: str):
@@ -34,103 +32,153 @@ def _aggregate_loss(loss_matrix, response_mask, loss_agg_mode: str):
     if loss_agg_mode == "token-mean":
         return _masked_mean(loss_matrix, response_mask)
 
-    per_sequence = []
-    lengths = []
-    for row, mask_row in zip(loss_matrix, response_mask):
-        valid = row[mask_row > 0]
-        if valid.numel() == 0:
+    per_sequence_losses = []
+    token_counts = []
+    for row_loss, row_mask in zip(loss_matrix, response_mask):
+        valid_loss = row_loss[row_mask > 0]
+        if valid_loss.numel() == 0:
             continue
-        per_sequence.append(valid.sum())
-        lengths.append(float(valid.numel()))
-    if not per_sequence:
+        per_sequence_losses.append(valid_loss.sum())
+        token_counts.append(float(valid_loss.numel()))
+    if not per_sequence_losses:
         return torch.tensor(0.0, device=loss_matrix.device)
-    stacked = torch.stack(per_sequence)
+
+    stacked_losses = torch.stack(per_sequence_losses)
     if loss_agg_mode == "seq-mean-token-sum":
-        return stacked.mean()
+        return stacked_losses.mean()
     if loss_agg_mode == "seq-mean-token-mean":
-        means = torch.stack([value / length for value, length in zip(per_sequence, lengths)])
-        return means.mean()
+        sequence_means = torch.stack([loss / count for loss, count in zip(per_sequence_losses, token_counts)])
+        return sequence_means.mean()
     if loss_agg_mode == "seq-mean-token-sum-norm":
-        scale = max(lengths)
-        return stacked.mean() / scale
+        return stacked_losses.mean() / max(token_counts)
     raise ValueError("Unsupported loss_agg_mode: %s" % loss_agg_mode)
 
 
-def _policy_loss(
+def _compute_policy_loss(
     current_log_probs,
     old_log_probs,
     advantages,
     response_mask,
-    cliprange: float,
-    cliprange_low: Optional[float],
-    cliprange_high: Optional[float],
+    clip_ratio: float,
+    clip_ratio_low: Optional[float],
+    clip_ratio_high: Optional[float],
     clip_ratio_c: float,
     loss_agg_mode: str,
 ):
-    torch, _, _, _ = require_hf_dependencies()
-    clip_low = cliprange if cliprange_low is None else cliprange_low
-    clip_high = cliprange if cliprange_high is None else cliprange_high
-
-    ratio = torch.exp((current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0))
-    unclipped = -advantages * ratio
-    clipped_ratio = ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high)
-    clipped = -advantages * clipped_ratio
-    candidate = torch.maximum(unclipped, clipped)
-    lower_clipped = torch.minimum(-advantages * clip_ratio_c, candidate)
-    final_loss = torch.where(advantages < 0.0, lower_clipped, candidate)
+    # 设定策略更新的允许范围，例如 $0.2$，即新策略的概率只能在旧策略的 $[0.8, 1.2]$ 之间浮动。
+    clip_low = clip_ratio if clip_ratio_low is None else clip_ratio_low
+    clip_high = clip_ratio if clip_ratio_high is None else clip_ratio_high
+    
+    # 采样（Rollout）时当时网络生成的概率对数（$\log \pi_{old}$）。
+    probability_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0).exp()
+    unclipped_loss = -advantages * probability_ratio
+    clipped_ratio = probability_ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high)
+    clipped_loss = -advantages * clipped_ratio
+    clipped_candidate = clipped_loss.maximum(unclipped_loss)
+    lower_clipped_loss = (-advantages * clip_ratio_c).minimum(clipped_candidate)
+    final_loss = clipped_candidate.where(advantages >= 0.0, lower_clipped_loss)
     masked_loss = final_loss * response_mask
-    loss = _aggregate_loss(masked_loss, response_mask, loss_agg_mode)
+    aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode)
 
-    total_tokens = response_mask.sum().clamp_min(1.0)
-    clip_hits = ((clipped > unclipped).float() * response_mask).sum() / total_tokens
-    lower_hits = (((advantages < 0.0) & (lower_clipped < candidate)).float() * response_mask).sum() / total_tokens
+    valid_token_count = response_mask.sum().clamp_min(1.0)
+    clip_fraction = ((clipped_loss > unclipped_loss).float() * response_mask).sum() / valid_token_count
+    lower_clip_fraction = (
+        (((advantages < 0.0) & (lower_clipped_loss < clipped_candidate)).float() * response_mask).sum()
+        / valid_token_count
+    )
     approx_kl = _masked_mean(-(current_log_probs - old_log_probs), response_mask)
-    return loss, {
-        "policy_clipfrac": float(clip_hits.detach().cpu()),
-        "policy_clipfrac_lower": float(lower_hits.detach().cpu()),
+    return aggregate, {
+        "policy_clipfrac": float(clip_fraction.detach().cpu()),
+        "policy_clipfrac_lower": float(lower_clip_fraction.detach().cpu()),
         "policy_approx_kl": float(approx_kl.detach().cpu()),
     }
 
 
-def _value_loss(values, returns, response_mask, cliprange_value: float, loss_agg_mode: str):
-    torch, _, _, _ = require_hf_dependencies()
-    clipped_values = torch.clamp(values, min=returns - cliprange_value, max=returns + cliprange_value)
-    unclipped = (values - returns) ** 2
-    clipped = (clipped_values - returns) ** 2
-    loss_matrix = torch.maximum(unclipped, clipped) * response_mask
-    loss = _aggregate_loss(loss_matrix, response_mask, loss_agg_mode)
-    denom = response_mask.sum().clamp_min(1.0)
-    abs_error = (((returns - values).abs()) * response_mask).sum() / denom
-    return loss, {"value_abs_error": float(abs_error.detach().cpu())}
+def _compute_value_loss(values, returns, response_mask, cliprange_value: float, loss_agg_mode: str):
+    clipped_values = values.clamp(min=returns - cliprange_value, max=returns + cliprange_value)
+    squared_error = (values - returns) ** 2
+    clipped_squared_error = (clipped_values - returns) ** 2
+    masked_loss = squared_error.maximum(clipped_squared_error) * response_mask
+    aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode)
+    absolute_error = ((returns - values).abs() * response_mask).sum() / response_mask.sum().clamp_min(1.0)
+    return aggregate, {"value_abs_error": float(absolute_error.detach().cpu())}
 
 
-def _kl_penalty_tensor(log_probs, ref_log_probs, mode: str = "low_var_kl"):
-    torch, _, _, _ = require_hf_dependencies()
-    diff = log_probs - ref_log_probs
+def _compute_kl_penalty(log_probs, ref_log_probs, mode: str = "low_var_kl"):
     if mode in {"kl", "k1"}:
-        return diff
+        return log_probs - ref_log_probs
     if mode == "abs":
-        return diff.abs()
+        return (log_probs - ref_log_probs).abs()
     if mode in {"mse", "k2"}:
-        return 0.5 * (diff ** 2)
+        return 0.5 * ((log_probs - ref_log_probs) ** 2)
     if mode in {"low_var_kl", "k3"}:
-        return torch.exp(-diff) + diff - 1.0
+        diff = log_probs - ref_log_probs
+        return (-diff).exp() + diff - 1.0
     raise ValueError("Unsupported KL penalty mode: %s" % mode)
 
 
-class _BaseHFWorker:
+def _infer_hidden_size(backbone_config) -> int:
+    for field_name in ("hidden_size", "n_embd"):
+        hidden_size = getattr(backbone_config, field_name, None)
+        if hidden_size is not None:
+            return int(hidden_size)
+    raise ValueError("Could not infer hidden size for the local HF critic backbone.")
+
+
+class HFWorkerBase:
     def __init__(self, model_config):
         self.model_config = model_config
-        self.device = default_device()
+        self.device = get_default_device()
 
-    def _full_sequence_tensors(self, batch):
+    def _build_model_inputs(self, batch):
+        """
+        Function:
+            - 将 batch 中的 input_ids 和 attention_mask 转换为适合模型输入的张量格式。
+        """
         torch, _, _, _ = require_hf_dependencies()
-        input_ids = batch_lists_to_tensor(batch.batch["input_ids"], 0, device=self.device, dtype=torch.long)
-        attention_mask = batch_lists_to_tensor(batch.batch["attention_mask"], 0, device=self.device, dtype=torch.long)
+        input_ids = batch_lists_to_tensor(batch.batch["input_ids"], 0, device=self.device, dtype=torch.long, padding_side='right')
+        attention_mask = batch_lists_to_tensor(batch.batch["attention_mask"], 0, device=self.device, dtype=torch.long, padding_side='right')
         return input_ids, attention_mask
 
+    def _compute_response_log_probs_and_entropy(self, model, batch):
+        """
+        Function:
+            - 计算给定 batch 中响应部分的对数概率和熵值。
+        Returns:
+            - response_log_probs: 一个二维张量，shape为 (batch_size, max_response_length)，其中每个元素表示对应位置的响应 token 的对数概率。
+            - response_entropy: 一个二维张量，shape为 (batch_size, max_response_length)，其中每个元素表示对应位置的响应 token 的熵值。
+        """
+        input_ids, attention_mask = self._build_model_inputs(batch)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        return extract_response_stats(
+            logits=outputs.logits,
+            input_ids=input_ids,
+            prompt_token_counts=get_prompt_lengths(batch),
+            response_token_counts=get_response_lengths(batch),
+        )
 
-class HFReferenceWorker(_BaseHFWorker, ReferenceWorker):
+    def _no_grad(self):
+        torch, _, _, _ = require_hf_dependencies()
+        return torch.no_grad()
+
+    def _iter_minibatches(self, batch, batch_size: int, shuffle: bool):
+        row_indices = list(range(len(batch)))
+        if shuffle:
+            random.shuffle(row_indices)
+        step = max(1, batch_size)
+        for start_index in range(0, len(row_indices), step):
+            yield batch.select(row_indices[start_index : start_index + step])
+
+    def _iter_microbatches(self, batch, micro_batch_size: Optional[int]):
+        if not micro_batch_size or micro_batch_size >= len(batch):
+            yield batch
+            return
+        row_indices = list(range(len(batch)))
+        for start_index in range(0, len(row_indices), micro_batch_size):
+            yield batch.select(row_indices[start_index : start_index + micro_batch_size])
+
+
+class HFReferenceWorker(HFWorkerBase, ReferenceWorker):
     def __init__(self, model_config, config):
         super().__init__(model_config)
         self.config = config
@@ -140,22 +188,13 @@ class HFReferenceWorker(_BaseHFWorker, ReferenceWorker):
             parameter.requires_grad_(False)
 
     def compute_log_probs(self, batch) -> LogProbResult:
-        with self._inference_mode():
-            log_probs, _ = self._compute_response_stats(batch)
-        lengths = response_lengths(batch)
+        with self._no_grad():
+            response_log_probs, _ = self._compute_response_log_probs_and_entropy(self.model, batch)
+        response_lengths = get_response_lengths(batch)
         return LogProbResult(
-            log_probs=tensor_to_list_rows(log_probs, lengths),
+            log_probs=tensor_to_list_rows(response_log_probs, response_lengths),
             metrics={"reference_enabled": 1.0},
         )
-
-    def _compute_response_stats(self, batch):
-        input_ids, attention_mask = self._full_sequence_tensors(batch)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        return extract_response_stats(outputs.logits, input_ids, prompt_lengths(batch), response_lengths(batch))
-
-    def _inference_mode(self):
-        torch, _, _, _ = require_hf_dependencies()
-        return torch.no_grad()
 
     def state_dict(self) -> Dict[str, Any]:
         return {"model_state": clone_model_state(self.model.state_dict())}
@@ -167,7 +206,7 @@ class HFReferenceWorker(_BaseHFWorker, ReferenceWorker):
         self.model.eval()
 
 
-class HFPolicyWorker(_BaseHFWorker, PolicyWorker):
+class HFPolicyWorker(HFWorkerBase, PolicyWorker):
     def __init__(self, model_config, config):
         super().__init__(model_config)
         torch, _, _, _ = require_hf_dependencies()
@@ -183,92 +222,78 @@ class HFPolicyWorker(_BaseHFWorker, PolicyWorker):
         self.update_steps = 0
 
     def compute_log_probs(self, batch) -> LogProbResult:
+        """
+        Function:
+            - 计算给定 batch 中响应部分的对数概率和熵值。
+        Returns:
+            - LogProbResult 对象，其中包含响应的对数概率、熵值以及一些指标（如 policy_update_steps）。
+                - log_probs: 一个列表的列表，每个子列表对应 batch 中一个样本的响应部分的对数概率。
+                - entropy: 一个列表的列表，每个子列表对应 batch 中一个样本的响应部分的熵值。
+                - metrics: 一个字典，包含一些指标信息，例如 policy_update_steps，表示当前策略更新的步数。
+        """
         self.model.eval()
-        with self._inference_mode():
-            log_probs, entropy = self._compute_response_stats(batch)
-        lengths = response_lengths(batch)
+        with self._no_grad():
+            response_log_probs, response_entropy = self._compute_response_log_probs_and_entropy(self.model, batch)
+        response_lengths = get_response_lengths(batch)
         return LogProbResult(
-            log_probs=tensor_to_list_rows(log_probs, lengths),
-            entropy=tensor_to_list_rows(entropy, lengths),
+            log_probs=tensor_to_list_rows(response_log_probs, response_lengths),
+            entropy=tensor_to_list_rows(response_entropy, response_lengths),
             metrics={"policy_update_steps": float(self.update_steps)},
         )
 
-    def _compute_response_stats(self, batch):
-        input_ids, attention_mask = self._full_sequence_tensors(batch)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        return extract_response_stats(outputs.logits, input_ids, prompt_lengths(batch), response_lengths(batch))
-
-    def _inference_mode(self):
-        torch, _, _, _ = require_hf_dependencies()
-        return torch.no_grad()
-
-    def _iter_minibatches(self, batch):
-        indices = list(range(len(batch)))
-        if self.config.shuffle:
-            random.shuffle(indices)
-        step = max(1, self.config.ppo_mini_batch_size)
-        for start in range(0, len(indices), step):
-            yield batch.select(indices[start : start + step])
-
-    def _iter_microbatches(self, batch):
-        if not self.config.micro_batch_size or self.config.micro_batch_size >= len(batch):
-            yield batch
-            return
-        indices = list(range(len(batch)))
-        for start in range(0, len(indices), self.config.micro_batch_size):
-            yield batch.select(indices[start : start + self.config.micro_batch_size])
-
     def update(self, batch) -> UpdateResult:
         torch, _, _, _ = require_hf_dependencies()
-        metrics_log: Dict[str, List[float]] = {}
+        metric_history: Dict[str, List[float]] = {}
         self.model.train()
 
-        # 外层循环是为了重复利用一个 batch 进行多轮 PPO 更新，
-        # 内层minibatch 是最小的更新单元(即每个 minibatch 都会进行一次反向传播)，
-        # microbatch 是为了在内存受限的情况下进一步分割 minibatch 的，microbatch 内的样本会被聚合成一个 loss 进行反向传播。
-        for _ in range(self.config.ppo_epochs):
-            for minibatch in self._iter_minibatches(batch):
-                mini_weight_total = 0.0
-                micro_batches = list(self._iter_microbatches(minibatch))
-                if not micro_batches:
+        for _ in range(self.config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
+            minibatches = self._iter_minibatches(batch, self.config.ppo_mini_batch_size, self.config.shuffle)
+            for minibatch in minibatches: # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
+                microbatches = list(self._iter_microbatches(minibatch, self.config.micro_batch_size))
+                if not microbatches:
                     continue
-                micro_weights: List[float] = []
-                for micro_batch in micro_batches:
-                    micro_weights.append(max(aggregate_weight(micro_batch, self.config.loss_agg_mode), 1.0))
-                total_weight = sum(micro_weights)
+
+                microbatch_weights = [
+                    max(get_loss_weight(microbatch, self.config.loss_agg_mode), 1.0) for microbatch in microbatches
+                ]
+                total_weight = sum(microbatch_weights)
 
                 self.optimizer.zero_grad()
-                for micro_batch, micro_weight in zip(micro_batches, micro_weights):
-                    current_log_probs, entropy = self._compute_response_stats(micro_batch)
-                    tensors = build_response_tensors(micro_batch, self.device)
-                    loss, micro_metrics = _policy_loss(
+                for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据 PPO 的损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
+                    current_log_probs, current_entropy = self._compute_response_log_probs_and_entropy(
+                        self.model, microbatch
+                    )
+                    training_tensors = build_training_tensors(microbatch, self.device)
+                    policy_loss, step_metrics = _compute_policy_loss(
                         current_log_probs=current_log_probs,
-                        old_log_probs=tensors["old_log_probs"],
-                        advantages=tensors["advantages"],
-                        response_mask=tensors["response_mask"],
-                        cliprange=self.config.clip_ratio,
-                        cliprange_low=self.config.clip_ratio_low,
-                        cliprange_high=self.config.clip_ratio_high,
+                        old_log_probs=training_tensors["old_log_probs"],
+                        advantages=training_tensors["advantages"],
+                        response_mask=training_tensors["response_mask"],
+                        clip_ratio=self.config.clip_ratio,
+                        clip_ratio_low=self.config.clip_ratio_low,
+                        clip_ratio_high=self.config.clip_ratio_high,
                         clip_ratio_c=self.config.clip_ratio_c,
                         loss_agg_mode=self.config.loss_agg_mode,
                     )
-                    entropy_mean = _masked_mean(entropy, tensors["response_mask"])
-                    total_loss = loss - (self.config.entropy_coeff * entropy_mean)
-                    micro_metrics["policy_entropy"] = float(entropy_mean.detach().cpu())
+                    entropy_bonus = _masked_mean(current_entropy, training_tensors["response_mask"])
+                    total_loss = policy_loss - (self.config.entropy_coeff * entropy_bonus)
+                    step_metrics["policy_entropy"] = float(entropy_bonus.detach().cpu())
 
-                    if self.config.use_kl_loss and "ref_log_probs" in micro_batch.batch:
-                        ref_log_probs = tensors["ref_log_probs"]
-                        kl_tensor = _kl_penalty_tensor(current_log_probs, ref_log_probs, mode="low_var_kl")
-                        kl_mean = _masked_mean(kl_tensor, tensors["response_mask"])
+                    if self.config.use_kl_loss and "ref_log_probs" in microbatch.batch:
+                        kl_penalty = _compute_kl_penalty(
+                            current_log_probs,
+                            training_tensors["ref_log_probs"],
+                            mode="low_var_kl",
+                        )
+                        kl_mean = _masked_mean(kl_penalty, training_tensors["response_mask"])
                         total_loss = total_loss + (self.config.kl_loss_coef * kl_mean)
-                        micro_metrics["actor_kl_loss"] = float(kl_mean.detach().cpu())
+                        step_metrics["actor_kl_loss"] = float(kl_mean.detach().cpu())
 
-                    scaled_loss = total_loss * (micro_weight / max(total_weight, 1.0))
+                    scaled_loss = total_loss * (microbatch_weight / max(total_weight, 1.0))
                     scaled_loss.backward()
-                    micro_metrics["actor_loss"] = float(total_loss.detach().cpu())
-                    mini_weight_total += micro_weight
-                    for key, value in micro_metrics.items():
-                        metrics_log.setdefault(key, []).append(float(value))
+                    step_metrics["actor_loss"] = float(total_loss.detach().cpu())
+                    for metric_name, metric_value in step_metrics.items():
+                        metric_history.setdefault(metric_name, []).append(float(metric_value))
 
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
@@ -276,9 +301,9 @@ class HFPolicyWorker(_BaseHFWorker, PolicyWorker):
 
         self.update_steps += 1
         self.model.eval()
-        reduced = {key: mean_of_values(values) for key, values in metrics_log.items()}
-        reduced["actor_update_steps"] = float(self.update_steps)
-        return UpdateResult(metrics=reduced)
+        averaged_metrics = {name: average_or_zero(values) for name, values in metric_history.items()}
+        averaged_metrics["actor_update_steps"] = float(self.update_steps)
+        return UpdateResult(metrics=averaged_metrics)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -297,26 +322,13 @@ class HFPolicyWorker(_BaseHFWorker, PolicyWorker):
         self.model.eval()
 
 
-class _ValueModelModule:
-    def __init__(self, model_config):
-        torch, _, _, _ = require_hf_dependencies()
-        self.backbone = load_backbone_model(model_config, path=model_config.critic_path)
-        hidden_size = getattr(self.backbone.config, "hidden_size", None)
-        if hidden_size is None:
-            hidden_size = getattr(self.backbone.config, "n_embd", None)
-        if hidden_size is None:
-            raise ValueError("Could not infer hidden size for the local HF critic backbone.")
-        self.value_head = torch.nn.Linear(hidden_size, 1)
-
-
-class HFValueWorker(_BaseHFWorker, ValueWorker):
+class HFValueWorker(HFWorkerBase, ValueWorker):
     def __init__(self, model_config, config):
         super().__init__(model_config)
         torch, _, _, _ = require_hf_dependencies()
         self.config = config
-        model_module = _ValueModelModule(model_config)
-        self.backbone = model_module.backbone.to(self.device)
-        self.value_head = model_module.value_head.to(self.device)
+        self.backbone = load_backbone_model(model_config, path=model_config.critic_path).to(self.device)
+        self.value_head = torch.nn.Linear(_infer_hidden_size(self.backbone.config), 1).to(self.device)
         self.optimizer = torch.optim.AdamW(
             list(self.backbone.parameters()) + list(self.value_head.parameters()),
             lr=config.lr,
@@ -326,83 +338,69 @@ class HFValueWorker(_BaseHFWorker, ValueWorker):
         )
         self.update_steps = 0
 
-    def _forward_values(self, batch):
-        input_ids, attention_mask = self._full_sequence_tensors(batch)
-        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
-        values = self.value_head(hidden_states).squeeze(-1)
-        prompt_lens = prompt_lengths(batch)
-        response_lens = response_lengths(batch)
-        torch, _, _, _ = require_hf_dependencies()
-        max_response_len = max(response_lens, default=0)
-        response_values = values.new_zeros((values.shape[0], max_response_len))
-        for row_index, (prompt_len, response_len) in enumerate(zip(prompt_lens, response_lens)):
-            if response_len <= 0:
+    def _compute_response_values(self, batch):
+        input_ids, attention_mask = self._build_model_inputs(batch)
+        hidden_states = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        token_values = self.value_head(hidden_states).squeeze(-1)
+
+        prompt_token_counts = get_prompt_lengths(batch)
+        response_token_counts = get_response_lengths(batch)
+        max_response_length = max(response_token_counts, default=0)
+        response_values = token_values.new_zeros((token_values.shape[0], max_response_length))
+        for row_index, (prompt_token_count, response_token_count) in enumerate(
+            zip(prompt_token_counts, response_token_counts)
+        ):
+            if response_token_count <= 0:
                 continue
-            start = prompt_len
-            end = start + response_len
-            response_values[row_index, :response_len] = values[row_index, start:end]
+            response_start = prompt_token_count
+            response_stop = response_start + response_token_count
+            response_values[row_index, :response_token_count] = token_values[row_index, response_start:response_stop]
         return response_values
 
     def compute_values(self, batch) -> ValueResult:
         self.backbone.eval()
         self.value_head.eval()
-        with self._inference_mode():
-            values = self._forward_values(batch)
+        with self._no_grad():
+            response_values = self._compute_response_values(batch)
         return ValueResult(
-            values=tensor_to_list_rows(values, response_lengths(batch)),
+            values=tensor_to_list_rows(response_values, get_response_lengths(batch)),
             metrics={"critic_update_steps": float(self.update_steps)},
         )
 
-    def _inference_mode(self):
-        torch, _, _, _ = require_hf_dependencies()
-        return torch.no_grad()
-
-    def _iter_minibatches(self, batch):
-        indices = list(range(len(batch)))
-        if self.config.shuffle:
-            random.shuffle(indices)
-        step = max(1, self.config.ppo_mini_batch_size)
-        for start in range(0, len(indices), step):
-            yield batch.select(indices[start : start + step])
-
-    def _iter_microbatches(self, batch):
-        if not self.config.micro_batch_size or self.config.micro_batch_size >= len(batch):
-            yield batch
-            return
-        indices = list(range(len(batch)))
-        for start in range(0, len(indices), self.config.micro_batch_size):
-            yield batch.select(indices[start : start + self.config.micro_batch_size])
-
     def update(self, batch) -> UpdateResult:
         torch, _, _, _ = require_hf_dependencies()
-        metrics_log: Dict[str, List[float]] = {}
+        metric_history: Dict[str, List[float]] = {}
         self.backbone.train()
         self.value_head.train()
 
         for _ in range(self.config.ppo_epochs):
-            for minibatch in self._iter_minibatches(batch):
-                micro_batches = list(self._iter_microbatches(minibatch))
-                if not micro_batches:
+            minibatches = self._iter_minibatches(batch, self.config.ppo_mini_batch_size, self.config.shuffle)
+            for minibatch in minibatches:
+                microbatches = list(self._iter_microbatches(minibatch, self.config.micro_batch_size))
+                if not microbatches:
                     continue
-                micro_weights = [max(aggregate_weight(micro_batch, self.config.loss_agg_mode), 1.0) for micro_batch in micro_batches]
-                total_weight = sum(micro_weights)
+
+                microbatch_weights = [
+                    max(get_loss_weight(microbatch, self.config.loss_agg_mode), 1.0) for microbatch in microbatches
+                ]
+                total_weight = sum(microbatch_weights)
+
                 self.optimizer.zero_grad()
-                for micro_batch, micro_weight in zip(micro_batches, micro_weights):
-                    value_predictions = self._forward_values(micro_batch)
-                    tensors = build_response_tensors(micro_batch, self.device)
-                    loss, micro_metrics = _value_loss(
-                        values=value_predictions,
-                        returns=tensors["returns"],
-                        response_mask=tensors["response_mask"],
+                for microbatch, microbatch_weight in zip(microbatches, microbatch_weights):
+                    predicted_values = self._compute_response_values(microbatch)
+                    training_tensors = build_training_tensors(microbatch, self.device)
+                    value_loss, step_metrics = _compute_value_loss(
+                        values=predicted_values,
+                        returns=training_tensors["returns"],
+                        response_mask=training_tensors["response_mask"],
                         cliprange_value=self.config.cliprange_value,
                         loss_agg_mode=self.config.loss_agg_mode,
                     )
-                    scaled_loss = loss * (micro_weight / max(total_weight, 1.0))
+                    scaled_loss = value_loss * (microbatch_weight / max(total_weight, 1.0))
                     scaled_loss.backward()
-                    micro_metrics["critic_loss"] = float(loss.detach().cpu())
-                    for key, value in micro_metrics.items():
-                        metrics_log.setdefault(key, []).append(float(value))
+                    step_metrics["critic_loss"] = float(value_loss.detach().cpu())
+                    for metric_name, metric_value in step_metrics.items():
+                        metric_history.setdefault(metric_name, []).append(float(metric_value))
 
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -414,9 +412,9 @@ class HFValueWorker(_BaseHFWorker, ValueWorker):
         self.update_steps += 1
         self.backbone.eval()
         self.value_head.eval()
-        reduced = {key: mean_of_values(values) for key, values in metrics_log.items()}
-        reduced["critic_update_steps"] = float(self.update_steps)
-        return UpdateResult(metrics=reduced)
+        averaged_metrics = {name: average_or_zero(values) for name, values in metric_history.items()}
+        averaged_metrics["critic_update_steps"] = float(self.update_steps)
+        return UpdateResult(metrics=averaged_metrics)
 
     def state_dict(self) -> Dict[str, Any]:
         return {

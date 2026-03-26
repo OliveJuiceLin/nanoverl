@@ -271,7 +271,7 @@ class RLTrainer:
         rollout_batch = self._prepare_rollout_batch(batch, rollout_params)
 
         t0 = time.time()
-        # 生成相应文本
+        # 生成response
         rollout_batch = self.rollout_engine.generate(rollout_batch, rollout_params)
         timing["rollout"] = time.time() - t0
 

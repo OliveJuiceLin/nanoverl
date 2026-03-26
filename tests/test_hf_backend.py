@@ -152,8 +152,8 @@ class HFBackendTest(unittest.TestCase):
         packed_rows = [
             pack_prompt_response_tokens(
                 tokenizer=tokenizer,
-                prompt_tokens=encode_text(tokenizer, prompt),
-                response_tokens=encode_text(tokenizer, response),
+                prompt_token_ids=encode_text(tokenizer, prompt),
+                response_token_ids=encode_text(tokenizer, response),
                 max_prompt_length=8,
                 max_response_length=4,
             )
@@ -181,8 +181,8 @@ class HFBackendTest(unittest.TestCase):
             )
             packed = pack_prompt_response_tokens(
                 tokenizer=tokenizer,
-                prompt_tokens=encode_text(tokenizer, "what is two plus two ? say yes"),
-                response_tokens=encode_text(tokenizer, "answer four yes no"),
+                prompt_token_ids=encode_text(tokenizer, "what is two plus two ? say yes"),
+                response_token_ids=encode_text(tokenizer, "answer four yes no"),
                 max_prompt_length=4,
                 max_response_length=2,
             )
