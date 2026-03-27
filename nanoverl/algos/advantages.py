@@ -46,11 +46,11 @@ def compute_grpo_advantages(
 ) -> Tuple[List[List[float]], List[List[float]]]:
     """Group-relative outcome advantages used by GRPO."""
 
-    sequence_scores = []
+    sequence_scores = [] # 每个响应文本的总奖励分数，计算方式是将 token_level_rewards 中对应响应文本的 token 的奖励分数加总起来（只加总 response_mask 中标记为 1 的 token），得到一个单一的分数，代表整个响应文本的奖励水平。
     for rewards_row, mask_row in zip(token_level_rewards, response_mask):
         sequence_scores.append(sum(value for value, mask in zip(rewards_row, mask_row) if mask))
 
-    grouped: Dict[str, List[float]] = {}
+    grouped: Dict[str, List[float]] = {} # 根据 group_ids 将 sequence_scores 分组，得到一个字典 grouped，其中键是 group_id，值是一个列表，包含了属于该 group_id 的所有 sequence_scores。这一步的目的是为了后续计算每个 group 内的平均分数和标准差，以便进行归一化处理。
     for group_id, score in zip(group_ids, sequence_scores):
         grouped.setdefault(group_id, []).append(score)
 

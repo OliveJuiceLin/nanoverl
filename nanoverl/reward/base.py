@@ -43,6 +43,16 @@ def load_reward_function(path: Optional[str], function_name: str) -> RewardFn:
     return reward_fn
 
 
+def _parse_reward_output(result: Any) -> tuple[float, Dict[str, Any]]:
+    # This helper is new in Phase 2 because reward plugins now need one clear,
+    # documented return contract instead of ad hoc parsing inside the main loop.
+    if isinstance(result, dict):
+        score = float(result.get("score", 0.0))
+        extra = {key: value for key, value in result.items() if key != "score"}
+        return score, extra
+    return float(result), {}
+
+
 class RewardManager:
     """
     Function:
@@ -61,7 +71,7 @@ class RewardManager:
         """
         prompt_texts = batch.non_tensor.get("prompt_text") or batch.non_tensor.get("prompt")
         response_texts = batch.non_tensor.get("response_text")
-        response_mask = batch.batch.get("response_mask")
+        
         if prompt_texts is None or response_texts is None or response_mask is None:
             raise ValueError("RewardManager requires prompt_text, response_text, and response_mask.")
 
@@ -69,17 +79,14 @@ class RewardManager:
         extras: Dict[str, List[Any]] = {}
         for index in range(len(batch)):
             row = batch.row(index)
-            result = self.reward_fn(str(prompt_texts[index]), str(response_texts[index]), row)
-            extra_payload: Dict[str, Any] = {}
-            score = result # 是一个数字
-            if isinstance(result, dict):
-                score = result.get("score", 0.0)
-                extra_payload = {key: value for key, value in result.items() if key != "score"}
-            mask_row = response_mask[index]
+            score, extra_payload = _parse_reward_output(
+                self.reward_fn(str(prompt_texts[index]), str(response_texts[index]), row)
+            )
+            mask_row = row.get("response_mask")
             rewards = [0.0 for _ in mask_row]
             valid_length = sum(1 for keep in mask_row if keep)
             if valid_length > 0:
-                rewards[valid_length - 1] = float(score) # 将奖励分配到最后一个有效 token 上，其他 token 的奖励为 0
+                rewards[valid_length - 1] = score # 将奖励分配到最后一个有效 token 上，其他 token 的奖励为 0
             token_level_scores.append(rewards)
             for key, value in extra_payload.items():
                 extras.setdefault(key, []).append(value) # 将额外信息按照键进行收集，构建一个字典，其中每个键对应一个列表，列表中的元素是每行数据(每个 example)的额外信息值。这些额外信息可以在后续的分析或日志记录中使用。

@@ -33,6 +33,7 @@ class HFRolloutEngine(RolloutEngine):
         self.policy_sync_steps = 0
 
     def generate(self, batch: RLBatch, sampling) -> RLBatch:
+        """加入字段 prompts、responses、input_ids(、attention_mask、response_mask 和 rollout_log_probs) 到 batch 中："""
         torch, _, _, _ = self._dependencies()
         prompt_texts: List[str] = batch.non_tensor.get("prompt_text") or batch.non_tensor.get("prompt")
         if prompt_texts is None:

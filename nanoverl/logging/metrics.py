@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import Dict, List
 
 from nanoverl.core.batch import RLBatch
@@ -21,7 +22,11 @@ def _stats(prefix: str, values: List[float]) -> Dict[str, float]:
     }
 
 
-def compute_data_metrics(batch: RLBatch, use_critic: bool = True) -> Dict[str, float]:
+def compute_data_metrics(
+    batch: RLBatch,
+    use_critic: bool = True,
+    response_length_limit: int | None = None,
+) -> Dict[str, float]:
     metrics: Dict[str, float] = {}
     response_lengths = [sum(mask_row) for mask_row in batch.batch.get("response_mask", [])]
     prompt_lengths = [len(prompt_row) for prompt_row in batch.batch.get("prompts", [])]
@@ -44,11 +49,31 @@ def compute_data_metrics(batch: RLBatch, use_critic: bool = True) -> Dict[str, f
         for value_row, mask_row in zip(batch.batch["values"], batch.batch["response_mask"]):
             valid_values.extend(value for value, keep in zip(value_row, mask_row) if keep)
         metrics.update(_stats("value", valid_values))
+        if "returns" in batch.batch and valid_values:
+            valid_returns = []
+            for return_row, mask_row in zip(batch.batch["returns"], batch.batch["response_mask"]):
+                valid_returns.extend(value for value, keep in zip(return_row, mask_row) if keep)
+            if valid_returns:
+                return_mean = sum(valid_returns) / len(valid_returns)
+                return_variance = sum((return_value - return_mean) ** 2 for return_value in valid_returns) / len(valid_returns)
+                if return_variance > 0.0:
+                    explained_variance = 1.0 - (
+                        sum((return_value - value) ** 2 for return_value, value in zip(valid_returns, valid_values))
+                        / len(valid_returns)
+                    ) / return_variance
+                    if isfinite(explained_variance):
+                        metrics["value/explained_variance"] = explained_variance
     metrics.update(_stats("response_length", [float(value) for value in response_lengths]))
     metrics.update(_stats("prompt_length", [float(value) for value in prompt_lengths]))
     if response_lengths:
         aborted = sum(1 for value in response_lengths if value == 0)
         metrics["response/aborted_ratio"] = aborted / len(response_lengths)
+        non_aborted_lengths = [float(value) for value in response_lengths if value > 0]
+        if non_aborted_lengths:
+            metrics["response_length_non_aborted/mean"] = sum(non_aborted_lengths) / len(non_aborted_lengths)
+        if response_length_limit is not None and response_length_limit > 0:
+            clipped = sum(1 for value in response_lengths if value >= response_length_limit)
+            metrics["response_length/clip_ratio"] = clipped / len(response_lengths)
     return metrics
 
 

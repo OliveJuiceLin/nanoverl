@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
-from dataclasses import asdict
 from typing import Dict, Optional
 
 from nanoverl.algos.advantages import compute_gae_advantages, compute_grpo_advantages
@@ -32,6 +32,7 @@ def _sampling_to_params(config: SamplingConfig) -> SamplingParams:
 
 
 def build_trainer(config: TrainerConfig) -> "RLTrainer":
+    # ========== 构建数据加载器 ==========
     train_dataset = JsonDataset(config.data.train_path)
     val_dataset = JsonDataset(config.data.val_path) if config.data.val_path else None
     train_loader = StatefulDataLoader(
@@ -52,14 +53,15 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
             seed=config.data.seed,
             drop_last=False,
         )
-
+    # ========== 构建 worker 和 rollout engine ==========
     policy_worker = create_policy_worker(config.actor.backend, config.model, config.actor)
     reference_worker = (
         create_reference_worker(config.reference.backend, config.model, config.reference)
         if config.reference.enable
         else None
     )
-    value_worker = create_value_worker(config.critic.backend, config.model, config.critic) if config.critic.enable else None
+    use_critic = config.critic.enable and config.algorithm.advantage_estimator != "grpo"
+    value_worker = create_value_worker(config.critic.backend, config.model, config.critic) if use_critic else None
 
     if config.rollout.backend == "debug":
         rollout_engine = DebugRolloutEngine(max_response_length=config.rollout.response_length)
@@ -67,7 +69,7 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
         rollout_engine = HFRolloutEngine(config.model, config.data, config.rollout)
     else:
         raise ValueError("Unknown rollout backend: %s" % config.rollout.backend)
-
+    # ========== 构建奖励函数管理器、日志跟踪器和检查点管理器 ==========
     reward_fn = load_reward_function(config.reward.function_path, config.reward.function_name)
     reward_manager = RewardManager(reward_fn)
     tracker = TrackingManager(
@@ -124,6 +126,11 @@ class RLTrainer:
     def close(self) -> None:
         self.tracker.close()
 
+    def _uses_critic(self) -> bool:
+        # This method is new in Phase 2 so PPO and GRPO can share one trainer loop
+        # without introducing a separate actor-only trainer for GRPO.
+        return self.value_worker is not None and self.config.algorithm.advantage_estimator != "grpo"
+
     def _ensure_uids(self, batch: RLBatch) -> RLBatch:
         """
         Function:
@@ -147,19 +154,91 @@ class RLTrainer:
             - 加入 rollout_index 来区分同一原始样本的不同采样版本
 
         """
-        batch = self._ensure_uids(batch)
+        batch = self._ensure_uids(batch) # uid表示每一个样本的 prompt 的唯一标识
         repeated = batch.repeat(sampling.n, interleave=True)
-        # 这里的 rollout_index 是为了在后续的奖励计算中区分同一原始样本（同一组）的不同采样版本，方便进行奖励分配和优势计算。
+        # 这里的 rollout_index 是为了在后续的奖励计算中区分同一原始 prompt（同一组）的不同采样版本
         # 例如index = 0, 1, 2, 3, 4 对应原始样本的不同版本，当 n=2 时，index % n 得[0, 1, 0, 1, 0]，表示每两个样本是一组采样版本。
         repeated.non_tensor["rollout_index"] = [index % sampling.n for index in range(len(repeated))]
         return repeated
 
     def _extract_rewards(self, batch: RLBatch) -> None:
+        """
+        加入字段 token_level_scores 和 extra 到 batch 中：
+        Function:
+            - 使用 reward_manager 来计算批次中每个样本的奖励分数，并将这些分数分配到响应文本的 token 上，构建一个 token_level_scores 列表，其中每个元素对应一个响应文本的 token-level 的奖励分数。
+            - 如果 reward_manager 计算过程中返回了额外的信息（extra），则将这些信息按照键进行收集，并存储在 batch.non_tensor 中，以便在后续的分析或日志记录中使用。
+        """
         reward_result = self.reward_manager.compute(batch) # 一个 dataclass, 包含 token_level_scores 和 extra 两个字段
         batch.batch["token_level_scores"] = reward_result.token_level_scores
         if reward_result.extra:
             for key, values in reward_result.extra.items():
                 batch.non_tensor[key] = values
+
+    def _balance_rollout_batch(self, batch: RLBatch) -> RLBatch:
+        """
+        Function:
+            在强化学习微调中（尤其是 GRPO 或 n > 1 的 PPO），模型生成的回复长短不一。如果按原始顺序直接把数据切成 mini-batch 送给 Actor 进行训练，极易出现显存碎片化或负载不均：
+            某个 mini-batch 凑巧全是长序列，导致 GPU 显存溢出（OOM）。某个 mini-batch 全是短序列，导致 GPU 算力闲置。
+            该函数的作用是在进入打分和训练阶段前，计算每条数据的真实 Token 长度，将它们重新排列。它在保证同一个 prompt 的多个预测版本（同 UID）不被打散的前提下，让切分后的各个 mini-batch 在总长度（Workload）上尽可能平均。
+        """
+        
+        # 如果配置中关闭了平衡 (balance_batch=False)，
+        # 或者整个 batch 的大小还不如一个 mini-batch 大，
+        # 或者缺少长度计算所需的键值，则直接原样返回。
+        if not self.config.trainer.balance_batch:
+            return batch
+        if len(batch) <= self.config.actor.ppo_mini_batch_size:
+            return batch
+        if "prompts" not in batch.batch or "response_mask" not in batch.batch:
+            return batch
+
+        target_partition_rows = max(1, self.config.actor.ppo_mini_batch_size) 
+        grouped_indices: Dict[str, list[int]] = {}
+        row_group_keys = batch.non_tensor.get("uid")
+        if row_group_keys is None:
+            row_group_keys = [str(index) for index in range(len(batch))]
+        for row_index, group_key in enumerate(row_group_keys):
+            grouped_indices.setdefault(str(group_key), []).append(row_index)
+
+        grouped_rows: list[list[int]] = list(grouped_indices.values())
+        if len(grouped_rows) <= 1:
+            return batch
+
+        grouped_workloads = []
+        for row_indices in grouped_rows: # 每一个 prompt 组的索引列表
+            workload = 0 # 计算这个 prompt 组的总 token 数，作为它的 workload。workload 的计算方式是：对于这个 prompt 组中的每一行数据，先加上 prompt 的 token 数量，再加上 response 中被 response_mask 标记为 1 的 token 数量。这样得到的 workload 就是这个 prompt 组在训练时对 GPU 资源的消耗程度。
+            for row_index in row_indices:
+                workload += len(batch.batch["prompts"][row_index])
+                workload += sum(int(value) for value in batch.batch["response_mask"][row_index])
+            grouped_workloads.append((workload, row_indices))
+
+        grouped_workloads.sort(key=lambda item: item[0], reverse=True) # 按照 workload 从大到小排序，优先处理那些工作量大的 prompt 组，以便更好地平衡后续 mini-batch 的负载。
+        partition_count = max(1, math.ceil(len(batch) / target_partition_rows)) # 
+        partitions = [{"rows": 0, "workload": 0, "indices": []} for _ in range(partition_count)]
+
+        for workload, row_indices in grouped_workloads: # 为每一组找一个合适的 partition 来放置它
+            fitting_partitions = [
+                partition
+                for partition in partitions
+                if partition["rows"] == 0 or partition["rows"] + len(row_indices) <= target_partition_rows
+            ] # 找出当前 prompt 组（row_indices）可以放得下的 partition，条件是这个 partition 要么还没有任何行（rows == 0），要么加上当前 prompt 组的行数后不超过 target_partition_rows。
+            if fitting_partitions:
+                target_partition = min(fitting_partitions, key=lambda partition: (partition["workload"], partition["rows"]))
+            else:
+                target_partition = min(partitions, key=lambda partition: (partition["workload"], partition["rows"]))
+            target_partition["indices"].extend(row_indices)
+            target_partition["rows"] += len(row_indices)
+            target_partition["workload"] += workload
+
+        reordered_indices = []
+        for partition in partitions:
+            reordered_indices.extend(partition["indices"])
+        if reordered_indices == list(range(len(batch))):
+            return batch
+
+        balanced_batch = batch.reorder(reordered_indices)
+        balanced_batch.meta["balanced_by_length"] = True
+        return balanced_batch
 
     def _shape_rewards(self, batch: RLBatch) -> Dict[str, float]:
         """
@@ -243,6 +322,7 @@ class RLTrainer:
             return {}
         scores = []
         data_sources = []
+        reward_extras: Dict[str, list[object]] = {}
         state = self.val_loader.state_dict() # 记录当前的读取位置
         self.val_loader.sampler.position = 0 # 把验证集的指针重置到开头，以确保每次验证都从头开始读取数据
         while True:
@@ -254,14 +334,14 @@ class RLTrainer:
             reward_result = self.reward_manager.compute(batch)
             scores.extend(sum(row) for row in reward_result.token_level_scores)
             data_sources.extend(batch.non_tensor.get("data_source", ["unknown"] * len(batch)))
+            for key, values in reward_result.extra.items():
+                reward_extras.setdefault(key, []).extend(values)
         self.val_loader.load_state_dict(state) # 恢复验证集的读取位置
-        metrics = summarize_validation(scores, data_sources)
+        metrics = summarize_validation(scores, data_sources, reward_extras=reward_extras)
         self.last_validation_metrics = metrics
         return metrics
 
-    def train_step(self, batch: RLBatch) -> Dict[str, float]:
-        # 注意，当前的 train_step 并不完全，例如并没有多次利用 rollout 数据进行更新，也没有实现一些算法特有的细节（如 PPO 的剪切机制）。
-        # 这些都可以在后续的迭代中逐步完善。 
+    def train_step(self, batch: RLBatch) -> Dict[str, float]: 
 
         step_started = time.time()
         metrics: Dict[str, float] = {}
@@ -274,33 +354,35 @@ class RLTrainer:
         # 生成response
         rollout_batch = self.rollout_engine.generate(rollout_batch, rollout_params)
         timing["rollout"] = time.time() - t0
+        rollout_batch = self._balance_rollout_batch(rollout_batch)
 
         t0 = time.time()
-        # 使用 reward_fn 计算句子的奖励
+        # 1. 使用 reward_fn 计算句子的奖励
         self._extract_rewards(rollout_batch)
         timing["reward_extract"] = time.time() - t0
 
         # 每个worker执行各自的工作：
         # 计时、计算、记录数值、记录指标
+
+        # 2. 计算旧策略的 log 概率 -> 重要性采样
+        # 这里 policy_worker 和 rollout 的模型的参数实际上是一样的: TODO: 未来可以把这一部分在 rollout_engine.generate() 的时候就计算好并放到 rollout_batch 里，这样就不需要在这里重复计算一次了。
         t0 = time.time()
         old_log_probs = self.policy_worker.compute_log_probs(rollout_batch)
         rollout_batch.batch["old_log_probs"] = old_log_probs.log_probs
         rollout_batch.batch["entropy"] = old_log_probs.entropy
         metrics.update({"actor/%s" % key: value for key, value in old_log_probs.metrics.items()})
         timing["policy_eval"] = time.time() - t0
-
+        # 3. 计算参考模型的 log 概率（如果 reference_worker 存在）-> 奖励 shaping 时会被用做 KL 惩罚作为 token-level 的奖励调整，同时也会被记录到 metrics 中以供分析。
         if self.reference_worker is not None:
-            # 如果 reference_worker 存在，计算参考模型的 log_probs，并将其添加到 rollout_batch 中，以便后续的奖励 shaping 和优势计算使用。同时，将参考模型评估的相关指标添加到 metrics 中，以便进行日志记录和分析。
             t0 = time.time()
             ref_log_probs = self.reference_worker.compute_log_probs(rollout_batch)
             rollout_batch.batch["ref_log_probs"] = ref_log_probs.log_probs
             metrics.update({"ref/%s" % key: value for key, value in ref_log_probs.metrics.items()})
             timing["reference_eval"] = time.time() - t0
-
-        if self.value_worker is not None:
-            # 如果 value_worker 存在，计算状态值函数的估计值，并将其添加到 rollout_batch 中，以便后续的优势计算使用。同时，将价值函数评估的相关指标添加到 metrics 中，以便进行日志记录和分析。
+        # 4. 计算状态值函数的估计值（如果 value_worker 存在） -> 优势计算时会被用做状态值估计来计算优势函数，同时也会被记录到 metrics 中以供分析。
+        if self._uses_critic():
             t0 = time.time()
-            values = self.value_worker.compute_values(rollout_batch)
+            values = self.value_worker.compute_values(rollout_batch)  # type: ignore[union-attr]
             rollout_batch.batch["values"] = values.values
             metrics.update({"critic/%s" % key: value for key, value in values.metrics.items()})
             timing["value_eval"] = time.time() - t0
@@ -308,7 +390,7 @@ class RLTrainer:
             rollout_batch.batch["values"] = [[0.0 for _ in row] for row in rollout_batch.batch["response_mask"]]
 
         t0 = time.time()
-        # 得出token_level_rewards字段
+        # 5. 得出token_level_rewards字段
         reward_metrics = self._shape_rewards(rollout_batch)
         metrics.update(reward_metrics)
         timing["reward_shape"] = time.time() - t0
@@ -320,22 +402,28 @@ class RLTrainer:
 
         # ===================== 进入更新阶段 =====================
         # 如果 value_worker 存在，首先更新价值函数，并将相关指标添加到 metrics 中，以便进行日志记录和分析。
-        if self.value_worker is not None:
+        if self._uses_critic():
             t0 = time.time()
-            critic_update = self.value_worker.update(rollout_batch)
-            metrics.update(critic_update.metrics)
+            critic_update = self.value_worker.update(rollout_batch)  # type: ignore[union-attr]
+            metrics.update({"critic/%s" % key: value for key, value in critic_update.metrics.items()})
             timing["critic_update"] = time.time() - t0
         # 如果全局步骤数已经超过了 critic_warmup 的设置，则更新策略，并将相关指标添加到 metrics 中，以便进行日志记录和分析。同时，将更新后的策略状态同步到 rollout_engine 中，以确保在后续的 rollout 过程中使用最新的策略进行生成。
         # 在 critic_warmup 阶段，训练过程只更新价值函数，而不更新策略。这是为了让价值函数先行学习一个相对稳定的状态值估计，从而在后续的策略更新中提供更准确的优势估计，帮助策略更有效地学习。
         if self.global_step >= self.config.trainer.critic_warmup:
             t0 = time.time()
             actor_update = self.policy_worker.update(rollout_batch)
-            metrics.update(actor_update.metrics)
+            metrics.update({"actor/%s" % key: value for key, value in actor_update.metrics.items()})
             self.rollout_engine.sync_policy(self.policy_worker.state_dict())
             timing["actor_update"] = time.time() - t0
 
         timing["step"] = time.time() - step_started
-        metrics.update(compute_data_metrics(rollout_batch, use_critic=self.value_worker is not None))
+        metrics.update(
+            compute_data_metrics(
+                rollout_batch,
+                use_critic=self._uses_critic(),
+                response_length_limit=self.config.rollout.response_length,
+            )
+        )
         metrics.update(compute_timing_metrics(timing))
         metrics.update(compute_throughput_metrics(rollout_batch, timing["step"], world_size=1))
         metrics["training/global_step"] = float(self.global_step)
@@ -362,14 +450,14 @@ class RLTrainer:
                 if batch is None:
                     break
 
-            metrics = self.train_step(batch)
+            metrics = self.train_step(batch) # 来自训练过程的指标
             self.global_step += 1
 
             if self.config.trainer.test_freq > 0 and self.val_loader is not None:
                 if self.global_step % self.config.trainer.test_freq == 0 or self.global_step == max_steps:
-                    metrics.update(self.validate())
+                    metrics.update(self.validate()) # 来自验证过程的指标
 
-            self.tracker.log(metrics, step=self.global_step)
+            self.tracker.log(metrics, step=self.global_step) # 来自训练过程和验证过程的指标都会被记录到 tracker 中，以便后续的分析和可视化。
 
             # 根据配置中的 save_freq 设置，定期保存训练检查点。当全局步骤数达到指定的保存频率时，调用 save_checkpoint 方法将当前的训练状态保存到磁盘
             if self.config.trainer.save_freq > 0:

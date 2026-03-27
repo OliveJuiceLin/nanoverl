@@ -101,6 +101,7 @@ class RLBatch:
 
     def select(self, indices: Sequence[int]) -> "RLBatch":
         """
+        按行选择数据
         Example:
             batch = RLBatch(
                 batch={"scores": [10, 20, 30, 40]},

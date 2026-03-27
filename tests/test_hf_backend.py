@@ -201,6 +201,7 @@ class HFBackendTest(unittest.TestCase):
                     "rollout": {"backend": "hf", "response_length": 4},
                     "actor": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
                     "critic": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "reference": {"enable": False},
                 }
             )
             tokenizer = load_tokenizer(config.model)
@@ -226,6 +227,8 @@ class HFBackendTest(unittest.TestCase):
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
                     "data": {"max_prompt_length": 8},
                     "actor": {"backend": "hf", "ppo_mini_batch_size": 1},
+                    "critic": {"enable": False},
+                    "reference": {"enable": False},
                     "rollout": {"backend": "hf", "response_length": 4},
                 }
             )

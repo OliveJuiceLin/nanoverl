@@ -246,28 +246,64 @@ class TrainerConfig:
     def validate(self) -> None:
         if self.data.train_batch_size <= 0:
             raise ConfigError("data.train_batch_size must be positive.")
+        if self.data.val_path and self.data.val_batch_size <= 0:
+            raise ConfigError("data.val_batch_size must be positive when validation is enabled.")
+        if self.data.max_prompt_length <= 0:
+            raise ConfigError("data.max_prompt_length must be positive.")
+        if self.data.max_response_length <= 0:
+            raise ConfigError("data.max_response_length must be positive.")
+        if self.algorithm.name not in {"ppo", "grpo"}:
+            raise ConfigError("algorithm.name must be either 'ppo' or 'grpo'.")
         if self.rollout.train.n <= 0:
             raise ConfigError("rollout.train.n must be positive.")
+        if self.rollout.validation.n <= 0:
+            raise ConfigError("rollout.validation.n must be positive.")
+        if self.rollout.response_length <= 0:
+            raise ConfigError("rollout.response_length must be positive.")
         if self.actor.ppo_mini_batch_size <= 0:
             raise ConfigError("actor.ppo_mini_batch_size must be positive.")
         if self.actor.micro_batch_size is not None and self.actor.micro_batch_size <= 0:
             raise ConfigError("actor.micro_batch_size must be positive when set.")
-        if self.critic.enable and self.critic.ppo_mini_batch_size <= 0:
+        uses_critic = self.critic.enable and self.algorithm.advantage_estimator != "grpo" and self.algorithm.name != "grpo"
+        if self.actor.micro_batch_size is not None:
+            if self.actor.micro_batch_size > self.actor.ppo_mini_batch_size:
+                raise ConfigError("actor.micro_batch_size must not exceed actor.ppo_mini_batch_size.")
+            if self.actor.ppo_mini_batch_size % self.actor.micro_batch_size != 0:
+                raise ConfigError("actor.ppo_mini_batch_size must be divisible by actor.micro_batch_size.")
+        if uses_critic and self.critic.ppo_mini_batch_size <= 0:
             raise ConfigError("critic.ppo_mini_batch_size must be positive when critic is enabled.")
-        if self.critic.enable and self.critic.micro_batch_size is not None and self.critic.micro_batch_size <= 0:
+        if uses_critic and self.critic.micro_batch_size is not None and self.critic.micro_batch_size <= 0:
             raise ConfigError("critic.micro_batch_size must be positive when set.")
+        if uses_critic and self.critic.micro_batch_size is not None:
+            if self.critic.micro_batch_size > self.critic.ppo_mini_batch_size:
+                raise ConfigError("critic.micro_batch_size must not exceed critic.ppo_mini_batch_size.")
+            if self.critic.ppo_mini_batch_size % self.critic.micro_batch_size != 0:
+                raise ConfigError("critic.ppo_mini_batch_size must be divisible by critic.micro_batch_size.")
         if self.algorithm.name == "grpo" and self.algorithm.advantage_estimator == "gae":
             self.algorithm.advantage_estimator = "grpo"
         if self.algorithm.advantage_estimator == "grpo" and self.rollout.train.n < 2:
             raise ConfigError("GRPO requires rollout.train.n >= 2.")
+        if self.algorithm.advantage_estimator == "grpo" and self.actor.ppo_mini_batch_size < self.rollout.train.n:
+            raise ConfigError("GRPO requires actor.ppo_mini_batch_size to cover at least one rollout group.")
         if self.algorithm.use_kl_in_reward and not self.reference.enable:
             raise ConfigError("Reference worker must be enabled when KL-in-reward is enabled.")
         if self.actor.use_kl_loss and not self.reference.enable:
             raise ConfigError("Reference worker must be enabled when actor KL loss is enabled.")
         if self.actor.backend == "hf" and self.rollout.backend != "hf":
             raise ConfigError("actor.backend='hf' requires rollout.backend='hf'.")
+        if self.actor.backend == "hf" and self.reference.enable and self.reference.backend != "hf":
+            raise ConfigError("reference.backend must be 'hf' when actor.backend is 'hf'.")
+        if self.actor.backend == "hf" and uses_critic and self.critic.backend != "hf":
+            raise ConfigError("critic.backend must be 'hf' when actor.backend is 'hf' and critic is used.")
         if self.rollout.backend == "hf" and self.model.tokenizer_path is None:
             self.model.tokenizer_path = self.model.path
+        if self.rollout.balance_by_length:
+            self.trainer.balance_batch = True
+        if self.trainer.balance_batch and uses_critic:
+            if self.actor.ppo_mini_batch_size != self.critic.ppo_mini_batch_size:
+                raise ConfigError(
+                    "trainer.balance_batch currently requires actor and critic mini-batch sizes to match."
+                )
         if self.ray.enabled and self.actor.backend == "debug":
             # This is intentionally permissive; debug workers still run locally.
             return

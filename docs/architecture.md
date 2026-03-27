@@ -1,6 +1,6 @@
 # Nanoverl Architecture
 
-`nanoverl` now has a complete local `Phase 1` path: the debug scaffold remains intact, and a real single-process Hugging Face PPO path runs through the same trainer loop, validation path, logging path, and checkpoint flow.
+`nanoverl` now has a complete local `Phase 1` path and the first `Phase 2` usability slice: the debug scaffold remains intact, and a real single-process Hugging Face PPO path runs through the same trainer loop, validation path, logging path, and checkpoint flow.
 
 ```mermaid
 flowchart LR
@@ -61,6 +61,31 @@ flowchart LR
   - rollout weight sync
   - validation and checkpointing
 
+## Phase 2 Progress
+
+- `trainer.balance_batch` is now active and applies one explicit driver-side batch balancing step after rollout.
+- GRPO is now a first-class actor-only path on the same trainer skeleton instead of an algorithm helper that happened to exist.
+- Reward plugins now support either a scalar score or a mapping with `score` plus extra fields.
+- Validation keeps the metric surface small and only summarizes clear reward extras:
+  - `val/reward_mean`
+  - `val/<data_source>/reward_mean`
+  - `val/extra/<name>_mean` for numeric reward extras
+- Training metrics also stay intentionally small:
+  - response clip ratio
+  - non-aborted response length mean
+  - value explained variance when the critic is active
+
+## Why This Direction Still Matches `verl`
+
+- The important `verl` RL semantics are preserved:
+  - rollout before reward and policy/value evaluation
+  - explicit old policy / reference / value ownership
+  - advantage computation on the driver
+  - critic update before actor update
+  - rollout weight refresh after actor update
+  - validation through the same rollout-plus-reward path
+- The current gap versus a fuller `verl`-style core is now mostly about research usability and backend breadth, not about missing PPO loop semantics.
+
 ## Intentional Gaps
 
 - The local HF backend is intentionally single-process and decoder-only first.
@@ -70,9 +95,9 @@ flowchart LR
 
 ## Recommended Next Extension
 
-Phase 1 is complete for the current local-workspace scope. The next extension should move into early `Phase 2`:
+The current repo is in early `Phase 2`. The next extension should stay focused on research usability before wider backend expansion:
 
-- add stronger HF regression coverage around checkpoint compatibility, rollout sync, and metric stability
-- improve config validation around HF batch sizing and tokenizer/model compatibility
-- add GRPO usability polish and reward-plugin ergonomics on top of the now-stable PPO core
+- add lightweight experiment dumps so failed runs are easier to inspect without introducing a large metric surface
+- improve a few remaining core config checks around grouped rollout sizing and HF path compatibility
+- make reward-plugin experiments easier to iterate on without adding reward-model serving yet
 - only then decide whether the next serious backend step is `FSDP` training or a thin inference adapter such as `vLLM`

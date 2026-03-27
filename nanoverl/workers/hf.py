@@ -163,7 +163,7 @@ class HFWorkerBase:
 
     def _iter_minibatches(self, batch, batch_size: int, shuffle: bool):
         row_indices = list(range(len(batch)))
-        if shuffle:
+        if shuffle and not batch.meta.get("balanced_by_length", False):
             random.shuffle(row_indices)
         step = max(1, batch_size)
         for start_index in range(0, len(row_indices), step):
