@@ -188,6 +188,9 @@ class TrainerRuntimeConfig:
     save_freq: int = 0
     critic_warmup: int = 0
     balance_batch: bool = False
+    train_dump_freq: int = 0
+    validation_dump_freq: int = 0
+    dump_max_rows: int = 8
     project_name: str = "nanoverl"
     experiment_name: str = "debug"
     default_local_dir: str = "checkpoints"
@@ -260,6 +263,22 @@ class TrainerConfig:
             raise ConfigError("rollout.validation.n must be positive.")
         if self.rollout.response_length <= 0:
             raise ConfigError("rollout.response_length must be positive.")
+        if self.trainer.total_epochs <= 0 and self.trainer.total_training_steps is None:
+            raise ConfigError("trainer.total_epochs must be positive when trainer.total_training_steps is not set.")
+        if self.trainer.total_training_steps is not None and self.trainer.total_training_steps < 0:
+            raise ConfigError("trainer.total_training_steps must be non-negative when set.")
+        if self.trainer.test_freq < 0:
+            raise ConfigError("trainer.test_freq must be non-negative.")
+        if self.trainer.save_freq < 0:
+            raise ConfigError("trainer.save_freq must be non-negative.")
+        if self.trainer.critic_warmup < 0:
+            raise ConfigError("trainer.critic_warmup must be non-negative.")
+        if self.trainer.train_dump_freq < 0:
+            raise ConfigError("trainer.train_dump_freq must be non-negative.")
+        if self.trainer.validation_dump_freq < 0:
+            raise ConfigError("trainer.validation_dump_freq must be non-negative.")
+        if self.trainer.dump_max_rows <= 0:
+            raise ConfigError("trainer.dump_max_rows must be positive.")
         if self.actor.ppo_mini_batch_size <= 0:
             raise ConfigError("actor.ppo_mini_batch_size must be positive.")
         if self.actor.micro_batch_size is not None and self.actor.micro_batch_size <= 0:
@@ -283,12 +302,22 @@ class TrainerConfig:
             self.algorithm.advantage_estimator = "grpo"
         if self.algorithm.advantage_estimator == "grpo" and self.rollout.train.n < 2:
             raise ConfigError("GRPO requires rollout.train.n >= 2.")
+        if self.algorithm.advantage_estimator == "grpo" and self.actor.ppo_mini_batch_size % self.rollout.train.n != 0:
+            raise ConfigError("GRPO requires actor.ppo_mini_batch_size to be divisible by rollout.train.n.")
         if self.algorithm.advantage_estimator == "grpo" and self.actor.ppo_mini_batch_size < self.rollout.train.n:
             raise ConfigError("GRPO requires actor.ppo_mini_batch_size to cover at least one rollout group.")
         if self.algorithm.use_kl_in_reward and not self.reference.enable:
             raise ConfigError("Reference worker must be enabled when KL-in-reward is enabled.")
         if self.actor.use_kl_loss and not self.reference.enable:
             raise ConfigError("Reference worker must be enabled when actor KL loss is enabled.")
+        if self.trainer.validate_only and not self.data.val_path:
+            raise ConfigError("trainer.validate_only requires data.val_path.")
+        if self.trainer.validate_only:
+            self.trainer.validate_before_train = True
+        if self.trainer.test_freq > 0 and not self.data.val_path:
+            raise ConfigError("trainer.test_freq requires data.val_path.")
+        if self.trainer.validation_dump_freq > 0 and not self.data.val_path:
+            raise ConfigError("trainer.validation_dump_freq requires data.val_path.")
         if self.actor.backend == "hf" and self.rollout.backend != "hf":
             raise ConfigError("actor.backend='hf' requires rollout.backend='hf'.")
         if self.actor.backend == "hf" and self.reference.enable and self.reference.backend != "hf":

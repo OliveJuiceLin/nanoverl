@@ -17,6 +17,7 @@ from nanoverl.logging.metrics import compute_data_metrics, compute_throughput_me
 from nanoverl.logging.trackers import TrackingManager
 from nanoverl.reward import RewardManager, load_reward_function
 from nanoverl.rollout import DebugRolloutEngine, HFRolloutEngine, SamplingParams
+from nanoverl.trainer.artifacts import ArtifactWriter, build_batch_preview_rows
 from nanoverl.trainer.validation import summarize_validation
 from nanoverl.workers import create_policy_worker, create_reference_worker, create_value_worker
 
@@ -79,6 +80,9 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
         config=config.to_dict(),
     )
     checkpoint_manager = CheckpointManager(config.trainer.default_local_dir)
+    artifact_writer = None
+    if config.trainer.train_dump_freq > 0 or config.trainer.validation_dump_freq > 0:
+        artifact_writer = ArtifactWriter(config.trainer.default_local_dir, config.trainer.experiment_name)
 
     return RLTrainer(
         config=config,
@@ -91,6 +95,7 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
         reward_manager=reward_manager,
         tracker=tracker,
         checkpoint_manager=checkpoint_manager,
+        artifact_writer=artifact_writer,
     )
 
 
@@ -109,6 +114,7 @@ class RLTrainer:
         reward_manager: RewardManager,
         tracker: TrackingManager,
         checkpoint_manager: CheckpointManager,
+        artifact_writer: Optional[ArtifactWriter] = None,
     ):
         self.config = config
         self.train_loader = train_loader
@@ -120,6 +126,7 @@ class RLTrainer:
         self.reward_manager = reward_manager
         self.tracker = tracker
         self.checkpoint_manager = checkpoint_manager
+        self.artifact_writer = artifact_writer
         self.global_step = 0
         self.last_validation_metrics: Dict[str, float] = {}
 
@@ -180,6 +187,9 @@ class RLTrainer:
             在强化学习微调中（尤其是 GRPO 或 n > 1 的 PPO），模型生成的回复长短不一。如果按原始顺序直接把数据切成 mini-batch 送给 Actor 进行训练，极易出现显存碎片化或负载不均：
             某个 mini-batch 凑巧全是长序列，导致 GPU 显存溢出（OOM）。某个 mini-batch 全是短序列，导致 GPU 算力闲置。
             该函数的作用是在进入打分和训练阶段前，计算每条数据的真实 Token 长度，将它们重新排列。它在保证同一个 prompt 的多个预测版本（同 UID）不被打散的前提下，让切分后的各个 mini-batch 在总长度（Workload）上尽可能平均。
+        Note:
+            - 当 rollout 次数 n 大于设定的 ppo_mini_batch_size 时，该平衡逻辑和实际截断切分会产生机制上的矛盾（桶多组少）。
+            - 建议配置上多注意 ppo_mini_batch_size 大于或等于 n。
         """
         
         # 如果配置中关闭了平衡 (balance_batch=False)，
@@ -240,9 +250,34 @@ class RLTrainer:
         balanced_batch.meta["balanced_by_length"] = True
         return balanced_batch
 
+    def _maybe_dump_train_preview(self, batch: RLBatch, logged_step: int) -> None:
+        # This method is new in Phase 2 because the Phase 1 trainer only exposed
+        # numeric logs. A tiny batch preview makes rollout and reward debugging much
+        # faster without introducing another analytics subsystem.
+        if self.artifact_writer is None or self.config.trainer.train_dump_freq <= 0: # 如果不需要写入训练预览，直接返回
+            return
+        if logged_step % self.config.trainer.train_dump_freq != 0:
+            return
+        preview_rows = build_batch_preview_rows(batch, self.config.trainer.dump_max_rows)
+        self.artifact_writer.write_train_preview(logged_step, preview_rows)
+
+    def _maybe_dump_validation_preview(
+        self,
+        metrics: Dict[str, float],
+        preview_rows: list[Dict[str, object]],
+    ) -> None:
+        # This method is new in Phase 2 because validation summaries became easier
+        # to trust once they were paired with a few representative prompt/response rows.
+        if self.artifact_writer is None or self.config.trainer.validation_dump_freq <= 0:
+            return
+        if self.global_step % self.config.trainer.validation_dump_freq != 0:
+            return
+        self.artifact_writer.write_validation_preview(self.global_step, metrics, preview_rows)
+
     def _shape_rewards(self, batch: RLBatch) -> Dict[str, float]:
         """
         Function:
+            - 整合 token_level_scores 和 KL 惩罚，生成最终的 token_level_rewards。
             - 根据配置中的 KL 惩罚设置，对原始的 token_level_scores 进行奖励 shaping，生成 token_level_rewards。
             - 如果启用了 KL 惩罚，并且 reference_worker 存在，则调用 apply_kl_penalty 函数来计算带有 KL 惩罚的奖励，并将其存储在 batch.batch["token_level_rewards"] 中。同时，将平均 KL 惩罚值添加到 metrics 中，以便进行日志记录和分析。
             - 如果没有启用 KL 惩罚或者 reference_worker 不存在，则直接将原始的 token_level_scores 作为 token_level_rewards 存储在 batch.batch["token_level_rewards"] 中。
@@ -323,6 +358,7 @@ class RLTrainer:
         scores = []
         data_sources = []
         reward_extras: Dict[str, list[object]] = {}
+        preview_rows: list[Dict[str, object]] = []
         state = self.val_loader.state_dict() # 记录当前的读取位置
         self.val_loader.sampler.position = 0 # 把验证集的指针重置到开头，以确保每次验证都从头开始读取数据
         while True:
@@ -336,8 +372,19 @@ class RLTrainer:
             data_sources.extend(batch.non_tensor.get("data_source", ["unknown"] * len(batch)))
             for key, values in reward_result.extra.items():
                 reward_extras.setdefault(key, []).extend(values)
+            remaining_preview_rows = self.config.trainer.dump_max_rows - len(preview_rows)
+            if remaining_preview_rows > 0:
+                preview_rows.extend(
+                    build_batch_preview_rows(
+                        batch,
+                        remaining_preview_rows,
+                        reward_scores=reward_result.token_level_scores,
+                        reward_extras=reward_result.extra,
+                    )
+                )
         self.val_loader.load_state_dict(state) # 恢复验证集的读取位置
         metrics = summarize_validation(scores, data_sources, reward_extras=reward_extras)
+        self._maybe_dump_validation_preview(metrics, preview_rows)
         self.last_validation_metrics = metrics
         return metrics
 
@@ -428,6 +475,7 @@ class RLTrainer:
         metrics.update(compute_throughput_metrics(rollout_batch, timing["step"], world_size=1))
         metrics["training/global_step"] = float(self.global_step)
         metrics["training/epoch"] = float(self.train_loader.epoch)
+        self._maybe_dump_train_preview(rollout_batch, self.global_step + 1)
         return metrics
 
     def fit(self) -> Dict[str, float]:

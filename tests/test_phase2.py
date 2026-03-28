@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +55,24 @@ class ConfigValidationTest(unittest.TestCase):
                 {
                     "algorithm": {"name": "grpo"},
                     "rollout": {"train": {"n": 1}},
+                }
+            )
+
+    def test_validate_only_requires_validation_data(self):
+        with self.assertRaises(ConfigError):
+            TrainerConfig.from_dict(
+                {
+                    "data": {"val_path": None},
+                    "trainer": {"validate_only": True},
+                }
+            )
+
+    def test_validation_dump_requires_validation_data(self):
+        with self.assertRaises(ConfigError):
+            TrainerConfig.from_dict(
+                {
+                    "data": {"val_path": None},
+                    "trainer": {"validation_dump_freq": 1},
                 }
             )
 
@@ -275,6 +294,83 @@ class TrainerPhase2Test(unittest.TestCase):
                 trainer.close()
             self.assertIn("val/extra/confidence_mean", metrics)
             self.assertNotIn("val/extra/label_mean", metrics)
+
+    def test_train_and_validation_previews_are_written(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reward_path = Path(tmpdir) / "reward_fn.py"
+            reward_path.write_text(
+                "\n".join(
+                    [
+                        "def compute_reward(prompt, response, sample):",
+                        "    return {",
+                        "        'score': 1.0 if response.strip() == sample['expected_response'] else 0.0,",
+                        "        'confidence': 0.9,",
+                        "    }",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dataset_path = Path(tmpdir) / "train.jsonl"
+            _write_jsonl(
+                dataset_path,
+                [
+                    {"prompt": "Respond with yes", "expected_response": "yes", "data_source": "qa"},
+                    {"prompt": "Respond with no", "expected_response": "no", "data_source": "qa"},
+                ],
+            )
+            config = TrainerConfig.from_dict(
+                {
+                    "data": {
+                        "train_path": str(dataset_path),
+                        "val_path": str(dataset_path),
+                        "train_batch_size": 2,
+                        "val_batch_size": 2,
+                        "shuffle": False,
+                    },
+                    "reward": {
+                        "function_path": str(reward_path),
+                        "function_name": "compute_reward",
+                    },
+                    "actor": {"backend": "debug", "ppo_mini_batch_size": 2},
+                    "critic": {"backend": "debug", "enable": False},
+                    "reference": {"backend": "debug", "enable": False},
+                    "rollout": {
+                        "backend": "debug",
+                        "response_length": 8,
+                        "validation": {"do_sample": False, "n": 1, "temperature": 0.0},
+                    },
+                    "trainer": {
+                        "total_training_steps": 1,
+                        "validate_before_train": True,
+                        "test_freq": 1,
+                        "save_freq": 0,
+                        "train_dump_freq": 1,
+                        "validation_dump_freq": 1,
+                        "dump_max_rows": 1,
+                        "loggers": [],
+                        "default_local_dir": tmpdir,
+                        "experiment_name": "artifact-preview-test",
+                    },
+                }
+            )
+            trainer = build_trainer(config)
+            try:
+                trainer.fit()
+            finally:
+                trainer.close()
+
+            artifact_root = Path(tmpdir) / "artifacts" / "artifact-preview-test"
+            train_payload = json.loads((artifact_root / "train_step_000001.json").read_text(encoding="utf-8"))
+            validation_payload = json.loads((artifact_root / "validation_step_000001.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(train_payload["kind"], "train")
+            self.assertEqual(len(train_payload["rows"]), 1)
+            self.assertIn("reward_score", train_payload["rows"][0])
+            self.assertEqual(validation_payload["kind"], "validation")
+            self.assertEqual(len(validation_payload["rows"]), 1)
+            self.assertIn("confidence", validation_payload["rows"][0])
+            self.assertIn("val/reward_mean", validation_payload["metrics"])
 
 
 if __name__ == "__main__":

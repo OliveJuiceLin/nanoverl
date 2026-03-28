@@ -66,6 +66,7 @@ flowchart LR
 - `trainer.balance_batch` is now active and applies one explicit driver-side batch balancing step after rollout.
 - GRPO is now a first-class actor-only path on the same trainer skeleton instead of an algorithm helper that happened to exist.
 - Reward plugins now support either a scalar score or a mapping with `score` plus extra fields.
+- Training and validation can now write lightweight JSON previews of rollout rows, so failed runs can be inspected without adding many more metrics.
 - Validation keeps the metric surface small and only summarizes clear reward extras:
   - `val/reward_mean`
   - `val/<data_source>/reward_mean`
@@ -93,11 +94,13 @@ flowchart LR
 - Ray integration is still intentionally thin.
 - vLLM, SGLang, LoRA, reward-model serving, and multi-turn/tool rollout are still deferred.
 
-## Recommended Next Extension
+## Phase 2 Status
 
-The current repo is in early `Phase 2`. The next extension should stay focused on research usability before wider backend expansion:
+The current repo now has the intended Phase 2 usability layer for the local PPO/GRPO core:
 
-- add lightweight experiment dumps so failed runs are easier to inspect without introducing a large metric surface
-- improve a few remaining core config checks around grouped rollout sizing and HF path compatibility
-- make reward-plugin experiments easier to iterate on without adding reward-model serving yet
-- only then decide whether the next serious backend step is `FSDP` training or a thin inference adapter such as `vLLM`
+- grouped rollout balancing is active
+- GRPO is explicit and actor-only
+- reward extras flow through validation and debug artifacts
+- lightweight experiment previews exist without overwhelming metric noise
+
+The next serious step should move to `Phase 3`, where the question is backend and research-coverage expansion rather than local trainer usability.
