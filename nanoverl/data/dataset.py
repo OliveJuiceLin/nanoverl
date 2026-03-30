@@ -56,6 +56,8 @@ class StatefulIndexSampler:
     size: int
     shuffle: bool = False
     seed: Optional[int] = None
+    rank: int = 0
+    world_size: int = 1
     epoch: int = 0
     position: int = 0
 
@@ -72,11 +74,15 @@ class StatefulIndexSampler:
     def next_indices(self, batch_size: int, drop_last: bool = True) -> Optional[List[int]]:
         if self.position >= self.size:
             return None
-        end = self.position + batch_size
+        global_batch_size = batch_size * max(self.world_size, 1)
+        end = self.position + global_batch_size
         if end > self.size and drop_last:
             return None
-        indices = self._order[self.position : min(end, self.size)]
-        self.position += len(indices)
+        batch_end = min(end, self.size)
+        shard_start = self.position + (self.rank * batch_size)
+        shard_end = min(shard_start + batch_size, batch_end)
+        indices = self._order[shard_start:shard_end]
+        self.position += global_batch_size
         return indices
 
     def reset_for_new_epoch(self) -> None:
@@ -92,12 +98,16 @@ class StatefulIndexSampler:
             "size": self.size,
             "shuffle": self.shuffle,
             "seed": self.seed,
+            "rank": self.rank,
+            "world_size": self.world_size,
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         self.epoch = int(state["epoch"])
         self.position = int(state["position"])
         self._order = list(state["order"])
+        self.rank = int(state.get("rank", self.rank))
+        self.world_size = int(state.get("world_size", self.world_size))
 
 
 class StatefulDataLoader:
@@ -111,17 +121,28 @@ class StatefulDataLoader:
         shuffle: bool = False,
         seed: Optional[int] = None,
         drop_last: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.prompt_key = prompt_key
         self.drop_last = drop_last
-        self.sampler = StatefulIndexSampler(len(dataset), shuffle=shuffle, seed=seed)
+        self.rank = rank
+        self.world_size = world_size
+        self.sampler = StatefulIndexSampler(
+            len(dataset),
+            shuffle=shuffle,
+            seed=seed,
+            rank=rank,
+            world_size=world_size,
+        )
 
     def __len__(self) -> int:
+        global_batch_size = self.batch_size * max(self.world_size, 1)
         if self.drop_last:
-            return len(self.dataset) // self.batch_size
-        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+            return len(self.dataset) // global_batch_size
+        return (len(self.dataset) + global_batch_size - 1) // global_batch_size
 
     @property
     def epoch(self) -> int:
@@ -142,6 +163,8 @@ class StatefulDataLoader:
             "batch_size": self.batch_size,
             "prompt_key": self.prompt_key,
             "drop_last": self.drop_last,
+            "rank": self.rank,
+            "world_size": self.world_size,
             "sampler": self.sampler.state_dict(),
         }
 

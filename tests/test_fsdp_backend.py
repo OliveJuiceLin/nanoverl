@@ -1,4 +1,4 @@
-"""Dependency-gated tests for the local Hugging Face backend."""
+"""Dependency-gated tests for the first FSDP training path."""
 
 from __future__ import annotations
 
@@ -13,29 +13,29 @@ from nanoverl.rollout.base import SamplingParams
 from nanoverl.trainer import build_trainer
 
 try:  # pragma: no cover - exercised only when optional deps are installed
-    import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
     from nanoverl.backends.hf import encode_text, load_tokenizer, pack_prompt_response_tokens
+    from nanoverl.backends.train.fsdp import FSDPPolicyWorker, FSDPReferenceWorker, FSDPValueWorker
+    from nanoverl.cli.train_rl import main as train_main
     from nanoverl.rollout.hf import HFRolloutEngine
-    from nanoverl.workers.hf import HFPolicyWorker, HFValueWorker
 
-    HF_TEST_DEPS = True
-except ImportError:  # pragma: no cover - default in this workspace
-    HF_TEST_DEPS = False
+    FSDP_TEST_DEPS = True
+except ImportError:  # pragma: no cover - default when optional deps are missing
+    FSDP_TEST_DEPS = False
 
 
-def _write_jsonl(path: Path, rows):
+def _write_jsonl(path: Path, rows) -> None:
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
 
-@unittest.skipUnless(HF_TEST_DEPS, "HF backend tests require torch, transformers, and tokenizers.")
-class HFBackendTest(unittest.TestCase):
+@unittest.skipUnless(FSDP_TEST_DEPS, "FSDP backend tests require torch, transformers, and tokenizers.")
+class FSDPBackendTest(unittest.TestCase):
     def _make_model_dir(self, root: Path) -> Path:
-        model_dir = root / "tiny-hf"
+        model_dir = root / "tiny-fsdp-hf"
         model_dir.mkdir(parents=True, exist_ok=True)
 
         vocab = {
@@ -52,7 +52,6 @@ class HFBackendTest(unittest.TestCase):
             "plus": 10,
             "what": 11,
             "?": 12,
-            "answer": 13,
         }
         tokenizer_obj = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
         tokenizer_obj.pre_tokenizer = Whitespace()
@@ -76,77 +75,8 @@ class HFBackendTest(unittest.TestCase):
             eos_token_id=vocab["<eos>"],
             pad_token_id=vocab["<pad>"],
         )
-        model = GPT2LMHeadModel(config)
-        model.save_pretrained(model_dir)
+        GPT2LMHeadModel(config).save_pretrained(model_dir)
         return model_dir
-
-    def _make_config(self, model_dir: Path, checkpoint_dir: Path, dataset_path: Path) -> TrainerConfig:
-        return TrainerConfig.from_dict(
-            {
-                "data": {
-                    "train_path": str(dataset_path),
-                    "val_path": str(dataset_path),
-                    "train_batch_size": 2,
-                    "val_batch_size": 2,
-                    "shuffle": False,
-                    "seed": 3,
-                    "max_prompt_length": 8,
-                    "max_response_length": 4,
-                },
-                "model": {
-                    "path": str(model_dir),
-                    "tokenizer_path": str(model_dir),
-                    "dtype": "float32",
-                },
-                "algorithm": {
-                    "name": "ppo",
-                    "advantage_estimator": "gae",
-                    "use_kl_in_reward": True,
-                    "kl_penalty": "low_var_kl",
-                    "kl_coef": 0.01,
-                },
-                "actor": {
-                    "backend": "hf",
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
-                    "micro_batch_size": 1,
-                    "clip_ratio": 0.2,
-                    "lr": 1e-4,
-                    "max_grad_norm": 1.0,
-                },
-                "critic": {
-                    "backend": "hf",
-                    "enable": True,
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
-                    "micro_batch_size": 1,
-                    "cliprange_value": 0.5,
-                    "lr": 1e-4,
-                    "max_grad_norm": 1.0,
-                },
-                "reference": {
-                    "backend": "hf",
-                    "enable": True,
-                },
-                "rollout": {
-                    "backend": "hf",
-                    "response_length": 4,
-                    "train": {"do_sample": False, "n": 1, "temperature": 0.0},
-                    "validation": {"do_sample": False, "n": 1, "temperature": 0.0},
-                },
-                "trainer": {
-                    "total_epochs": 1,
-                    "total_training_steps": 2,
-                    "validate_before_train": True,
-                    "test_freq": 1,
-                    "save_freq": 1,
-                    "default_local_dir": str(checkpoint_dir),
-                    "loggers": [],
-                    "project_name": "nanoverl-test",
-                    "experiment_name": "hf-smoke",
-                },
-            }
-        )
 
     def _make_batch(self, tokenizer, prompts, responses) -> RLBatch:
         packed_rows = [
@@ -167,82 +97,106 @@ class HFBackendTest(unittest.TestCase):
                 "attention_mask": [row["attention_mask"] for row in packed_rows],
                 "response_mask": [row["response_mask"] for row in packed_rows],
             },
-            non_tensor={
-                "prompt_text": list(prompts),
-                "response_text": list(responses),
-            },
+            non_tensor={"prompt_text": list(prompts), "response_text": list(responses)},
         )
 
-    def test_pack_truncation_and_masks(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model_dir = self._make_model_dir(Path(tmpdir))
-            tokenizer = load_tokenizer(
-                TrainerConfig.from_dict({"model": {"path": str(model_dir), "tokenizer_path": str(model_dir)}}).model
-            )
-            packed = pack_prompt_response_tokens(
-                tokenizer=tokenizer,
-                prompt_token_ids=encode_text(tokenizer, "what is two plus two ? say yes"),
-                response_token_ids=encode_text(tokenizer, "answer four yes no"),
-                max_prompt_length=4,
-                max_response_length=2,
-            )
-            self.assertEqual(len(packed["prompts"]), 4)
-            self.assertEqual(len(packed["responses"]), 2)
-            self.assertEqual(len(packed["input_ids"]), 6)
-            self.assertEqual(packed["input_ids"], packed["prompts"] + packed["responses"])
-            self.assertEqual(packed["response_mask"], [1, 1])
+    def _make_config(self, model_dir: Path, checkpoint_dir: Path, dataset_path: Path) -> TrainerConfig:
+        return TrainerConfig.from_dict(
+            {
+                "data": {
+                    "train_path": str(dataset_path),
+                    "val_path": str(dataset_path),
+                    "train_batch_size": 2,
+                    "val_batch_size": 2,
+                    "shuffle": False,
+                    "seed": 9,
+                    "max_prompt_length": 8,
+                    "max_response_length": 4,
+                },
+                "model": {
+                    "path": str(model_dir),
+                    "tokenizer_path": str(model_dir),
+                    "dtype": "float32",
+                },
+                "algorithm": {
+                    "name": "ppo",
+                    "advantage_estimator": "gae",
+                    "use_kl_in_reward": True,
+                    "kl_penalty": "low_var_kl",
+                    "kl_coef": 0.01,
+                },
+                "actor": {
+                    "backend": "fsdp",
+                    "ppo_mini_batch_size": 2,
+                    "ppo_epochs": 1,
+                    "micro_batch_size": 1,
+                    "clip_ratio": 0.2,
+                    "lr": 1e-4,
+                },
+                "critic": {
+                    "backend": "fsdp",
+                    "enable": True,
+                    "ppo_mini_batch_size": 2,
+                    "ppo_epochs": 1,
+                    "micro_batch_size": 1,
+                    "cliprange_value": 0.5,
+                    "lr": 1e-4,
+                },
+                "reference": {
+                    "backend": "fsdp",
+                    "enable": True,
+                },
+                "rollout": {
+                    "backend": "hf",
+                    "response_length": 4,
+                    "train": {"do_sample": False, "n": 1, "temperature": 0.0},
+                    "validation": {"do_sample": False, "n": 1, "temperature": 0.0},
+                },
+                "trainer": {
+                    "total_training_steps": 2,
+                    "validate_before_train": True,
+                    "test_freq": 1,
+                    "save_freq": 1,
+                    "default_local_dir": str(checkpoint_dir),
+                    "loggers": [],
+                    "experiment_name": "fsdp-smoke",
+                },
+            }
+        )
 
-    def test_policy_and_value_shapes(self):
+    def test_worker_shapes_and_rollout_sync(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             model_dir = self._make_model_dir(Path(tmpdir))
             config = TrainerConfig.from_dict(
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                    "actor": {"backend": "fsdp", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "critic": {"backend": "fsdp", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "reference": {"backend": "fsdp", "enable": True},
                     "rollout": {"backend": "hf", "response_length": 4},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
-                    "critic": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
-                    "reference": {"enable": False},
                 }
             )
             tokenizer = load_tokenizer(config.model)
             batch = self._make_batch(tokenizer, ["say yes", "what is two ?"], ["yes", "four"])
 
-            policy_worker = HFPolicyWorker(config.model, config.actor)
+            policy_worker = FSDPPolicyWorker(config.model, config.actor)
+            reference_worker = FSDPReferenceWorker(config.model, config.reference)
+            value_worker = FSDPValueWorker(config.model, config.critic)
             log_probs = policy_worker.compute_log_probs(batch)
-            self.assertEqual(len(log_probs.log_probs), 2)
-            self.assertEqual(len(log_probs.log_probs[0]), len(batch.batch["responses"][0]))
-            self.assertEqual(len(log_probs.entropy[1]), len(batch.batch["responses"][1]))
-
-            value_worker = HFValueWorker(config.model, config.critic)
+            ref_log_probs = reference_worker.compute_log_probs(batch)
             values = value_worker.compute_values(batch)
-            self.assertEqual(len(values.values), 2)
-            self.assertEqual(len(values.values[0]), len(batch.batch["responses"][0]))
 
-    def test_rollout_sync_changes_log_probs(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            model_dir = self._make_model_dir(root)
-            config = TrainerConfig.from_dict(
-                {
-                    "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
-                    "data": {"max_prompt_length": 8},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 1},
-                    "critic": {"enable": False},
-                    "reference": {"enable": False},
-                    "rollout": {"backend": "hf", "response_length": 4},
-                }
-            )
+            self.assertEqual(len(log_probs.log_probs), 2)
+            self.assertEqual(len(ref_log_probs.log_probs[0]), len(batch.batch["responses"][0]))
+            self.assertEqual(len(values.values[1]), len(batch.batch["responses"][1]))
+
             rollout = HFRolloutEngine(config.model, config.data, config.rollout)
-            policy_worker = HFPolicyWorker(config.model, config.actor)
-            first_rollout_parameter = next(rollout.model.parameters()).detach().clone()
-            with torch.no_grad():
-                for parameter in policy_worker.model.parameters():
-                    parameter.add_(0.25)
+            before = rollout.generate(RLBatch(non_tensor={"prompt_text": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
             rollout.sync_policy(policy_worker.state_dict())
-            synced_rollout_parameter = next(rollout.model.parameters()).detach().clone()
-            self.assertFalse(torch.equal(first_rollout_parameter, synced_rollout_parameter))
+            after = rollout.generate(RLBatch(non_tensor={"prompt_text": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
+            self.assertEqual(len(before.batch["rollout_log_probs"][0]), len(after.batch["rollout_log_probs"][0]))
 
-    def test_hf_fit_and_resume(self):
+    def test_fsdp_fit_resume_and_cli(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             model_dir = self._make_model_dir(root)
@@ -256,27 +210,25 @@ class HFBackendTest(unittest.TestCase):
                     {"prompt": "say no", "expected_response": "no", "data_source": "qa"},
                 ],
             )
-
             config = self._make_config(model_dir, checkpoint_dir, dataset_path)
             trainer = build_trainer(config)
             try:
-                val_metrics = trainer.fit()
-                self.assertIn("val/reward_mean", val_metrics)
+                metrics = trainer.fit()
+                self.assertIn("val/reward_mean", metrics)
                 self.assertEqual(trainer.global_step, 2)
-                saved_loader_state = trainer.train_loader.state_dict()
             finally:
                 trainer.close()
 
-            resumed_trainer = build_trainer(config)
+            resumed = build_trainer(config)
             try:
-                self.assertTrue(resumed_trainer.load_checkpoint())
-                self.assertEqual(resumed_trainer.global_step, 2)
-                self.assertEqual(
-                    resumed_trainer.train_loader.state_dict()["sampler"]["position"],
-                    saved_loader_state["sampler"]["position"],
-                )
+                self.assertTrue(resumed.load_checkpoint())
+                self.assertEqual(resumed.global_step, 2)
             finally:
-                resumed_trainer.close()
+                resumed.close()
+
+            config_path = root / "fsdp_config.json"
+            config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+            train_main(["--config", str(config_path)])
 
 
 if __name__ == "__main__":

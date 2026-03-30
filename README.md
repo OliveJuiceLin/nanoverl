@@ -175,7 +175,7 @@ The repository now includes the first implementation pass of the planned archite
 - `nanoverl.checkpoint.CheckpointManager`
   - local save/resume of trainer and worker state
 
-This is intentionally a clean, readable scaffold first. The debug backend is runnable today, while the FSDP backend is scaffolded as the next real integration target.
+This is intentionally a clean, readable RL core. The debug and local HF paths are runnable today, and the first single-node FSDP training path now exists as the Phase 3 backend expansion.
 
 ## Quickstart
 
@@ -183,6 +183,25 @@ Run the built-in debug PPO example:
 
 ```bash
 python3 -m nanoverl.cli.train_rl --config examples/configs/debug_ppo.json
+```
+
+Run the local HF PPO example:
+
+```bash
+python3 -m nanoverl.cli.train_rl --config examples/configs/hf_local_ppo.json
+```
+
+Run the first single-node FSDP training preset:
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m nanoverl.cli.train_rl --config examples/configs/fsdp_single_node_ppo.json
+```
+
+The packaged CLI aliases are:
+
+```bash
+nanoverl-train --config examples/configs/debug_ppo.json
+nanoverl-train-rl --config examples/configs/debug_ppo.json
 ```
 
 Run the test suite:
@@ -193,8 +212,8 @@ python3 -m unittest discover -s tests -v
 
 ## Notes On Dependencies
 
-The current workspace does not ship with `torch`, `ray`, or `PyYAML`, so the repository is implemented to:
+The repository is implemented to:
 
 - run the debug path with only the Python standard library
 - keep `torch`/`ray` as explicit optional dependencies in `pyproject.toml`
-- expose the intended FSDP and Ray architecture without pretending those integrations are complete yet
+- expose a real local HF path and a first single-node FSDP path before adding heavier runtime layers such as Ray

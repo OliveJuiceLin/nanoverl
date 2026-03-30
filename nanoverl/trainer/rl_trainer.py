@@ -13,6 +13,7 @@ from nanoverl.checkpoint.manager import CheckpointManager
 from nanoverl.config import SamplingConfig, TrainerConfig
 from nanoverl.core.batch import RLBatch
 from nanoverl.data.dataset import JsonDataset, StatefulDataLoader
+from nanoverl.distributed import TorchDistributedRuntime
 from nanoverl.logging.metrics import compute_data_metrics, compute_throughput_metrics, compute_timing_metrics
 from nanoverl.logging.trackers import TrackingManager
 from nanoverl.reward import RewardManager, load_reward_function
@@ -33,26 +34,44 @@ def _sampling_to_params(config: SamplingConfig) -> SamplingParams:
 
 
 def build_trainer(config: TrainerConfig) -> "RLTrainer":
+    runtime: TorchDistributedRuntime = TorchDistributedRuntime.from_environment()
+    train_batch_size = config.data.train_batch_size
+    val_batch_size = config.data.val_batch_size
+
+    if runtime.enabled: # 如果开启了分布式训练，进行以下检查和调整单机数据量
+        # 确保全局批次大小（Global Batch Size）能够均匀地分配到每一个计算设备上
+        if train_batch_size % runtime.world_size != 0:
+            raise ValueError("data.train_batch_size must be divisible by WORLD_SIZE for distributed training.")
+        if config.data.val_path and val_batch_size % runtime.world_size != 0:
+            raise ValueError("data.val_batch_size must be divisible by WORLD_SIZE for distributed validation.")
+        # 将变量从“全局总计”更新为“单机/单卡”的大小。后续的 DataLoader 将使用这个计算后的局部值。
+        train_batch_size //= runtime.world_size
+        val_batch_size //= runtime.world_size
+
     # ========== 构建数据加载器 ==========
     train_dataset = JsonDataset(config.data.train_path)
     val_dataset = JsonDataset(config.data.val_path) if config.data.val_path else None
     train_loader = StatefulDataLoader(
         train_dataset,
-        batch_size=config.data.train_batch_size,
+        batch_size=train_batch_size,
         prompt_key=config.data.prompt_key,
         shuffle=config.data.shuffle,
         seed=config.data.seed,
         drop_last=True,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
     )
     val_loader = None
     if val_dataset is not None:
         val_loader = StatefulDataLoader(
             val_dataset,
-            batch_size=config.data.val_batch_size,
+            batch_size=val_batch_size,
             prompt_key=config.data.prompt_key,
             shuffle=False,
             seed=config.data.seed,
             drop_last=False,
+            rank=runtime.rank,
+            world_size=runtime.world_size,
         )
     # ========== 构建 worker 和 rollout engine ==========
     policy_worker = create_policy_worker(config.actor.backend, config.model, config.actor)
@@ -76,12 +95,12 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
     tracker = TrackingManager(
         project_name=config.trainer.project_name,
         experiment_name=config.trainer.experiment_name,
-        backends=config.trainer.loggers,
+        backends=config.trainer.loggers if runtime.is_main_process else (), # 只在主进程中启用日志记录，以避免重复记录和竞争条件
         config=config.to_dict(),
     )
     checkpoint_manager = CheckpointManager(config.trainer.default_local_dir)
     artifact_writer = None
-    if config.trainer.train_dump_freq > 0 or config.trainer.validation_dump_freq > 0:
+    if runtime.is_main_process and (config.trainer.train_dump_freq > 0 or config.trainer.validation_dump_freq > 0):
         artifact_writer = ArtifactWriter(config.trainer.default_local_dir, config.trainer.experiment_name)
 
     return RLTrainer(
@@ -96,6 +115,7 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
         tracker=tracker,
         checkpoint_manager=checkpoint_manager,
         artifact_writer=artifact_writer,
+        runtime=runtime,
     )
 
 
@@ -115,6 +135,7 @@ class RLTrainer:
         tracker: TrackingManager,
         checkpoint_manager: CheckpointManager,
         artifact_writer: Optional[ArtifactWriter] = None,
+        runtime: Optional[TorchDistributedRuntime] = None,
     ):
         self.config = config
         self.train_loader = train_loader
@@ -127,6 +148,7 @@ class RLTrainer:
         self.tracker = tracker
         self.checkpoint_manager = checkpoint_manager
         self.artifact_writer = artifact_writer
+        self.runtime = runtime or TorchDistributedRuntime()
         self.global_step = 0
         self.last_validation_metrics: Dict[str, float] = {}
 
@@ -156,7 +178,7 @@ class RLTrainer:
     def _prepare_rollout_batch(self, batch: RLBatch, sampling: SamplingParams) -> RLBatch:
         """
         Function:
-            - 确保批次中的每个样本都有一个唯一的 UID，以便在后续的 rollout 和奖励计算过程中进行跟踪。
+            - 确保批次中的每个样本(prompt)都有一个唯一的 UID，以便在后续的 rollout 和奖励计算过程中进行跟踪。
             - 根据采样参数重复批次中的每个样本，以便在 rollout 过程中生成多个响应版本。
             - 加入 rollout_index 来区分同一原始样本的不同采样版本
 
@@ -335,7 +357,9 @@ class RLTrainer:
         }
 
     def save_checkpoint(self) -> None:
-        self.checkpoint_manager.save(self.global_step, self._checkpoint_payload())
+        if self.runtime.is_main_process:
+            self.checkpoint_manager.save(self.global_step, self._checkpoint_payload())
+        self.runtime.barrier()
 
     def load_checkpoint(self) -> bool:
         payload = self.checkpoint_manager.load_latest() # load(checkpoint_dir) | none
@@ -382,9 +406,26 @@ class RLTrainer:
                         reward_extras=reward_result.extra,
                     )
                 )
+        gathered_scores = self.runtime.all_gather_objects(scores)
+        gathered_data_sources = self.runtime.all_gather_objects(data_sources)
+        gathered_reward_extras = self.runtime.all_gather_objects(reward_extras)
+        gathered_preview_rows = self.runtime.all_gather_objects(preview_rows)
         self.val_loader.load_state_dict(state) # 恢复验证集的读取位置
-        metrics = summarize_validation(scores, data_sources, reward_extras=reward_extras)
-        self._maybe_dump_validation_preview(metrics, preview_rows)
+        merged_scores = [score for rank_scores in gathered_scores for score in rank_scores]
+        merged_data_sources = [source for rank_sources in gathered_data_sources for source in rank_sources]
+        merged_reward_extras: Dict[str, list[object]] = {}
+        for rank_reward_extras in gathered_reward_extras:
+            for key, values in rank_reward_extras.items():
+                merged_reward_extras.setdefault(key, []).extend(values)
+        merged_preview_rows = [
+            row
+            for rank_preview_rows in gathered_preview_rows
+            for row in rank_preview_rows
+        ][: self.config.trainer.dump_max_rows]
+        metrics = summarize_validation(merged_scores, merged_data_sources, reward_extras=merged_reward_extras)
+        if self.runtime.is_main_process:
+            self._maybe_dump_validation_preview(metrics, merged_preview_rows)
+        metrics = self.runtime.broadcast_object(metrics, src=0)
         self.last_validation_metrics = metrics
         return metrics
 

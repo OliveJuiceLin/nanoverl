@@ -1,6 +1,6 @@
 # Nanoverl Architecture
 
-`nanoverl` now has a complete local `Phase 1` path and the first `Phase 2` usability slice: the debug scaffold remains intact, and a real single-process Hugging Face PPO path runs through the same trainer loop, validation path, logging path, and checkpoint flow.
+`nanoverl` now has a complete local `Phase 1` path, the intended `Phase 2` usability layer, and the first `Phase 3` backend expansion: the debug scaffold remains intact, the single-process Hugging Face PPO path stays the readable baseline, and a first single-node FSDP training path now runs through the same trainer loop, validation path, logging path, and checkpoint flow.
 
 ```mermaid
 flowchart LR
@@ -38,6 +38,8 @@ flowchart LR
   - Explicit policy, reference, and value worker boundaries.
 - `nanoverl.workers.HF*Worker`
   - Local policy, reference, and value workers backed by `torch` and `transformers`.
+- `nanoverl.backends.train.FSDP*Worker`
+  - First single-node multi-GPU training backend using torch FSDP while preserving the same worker interfaces and trainer loop.
 - `nanoverl.checkpoint.CheckpointManager`
   - Local save/resume of trainer and worker state.
 
@@ -94,13 +96,15 @@ flowchart LR
 - Ray integration is still intentionally thin.
 - vLLM, SGLang, LoRA, reward-model serving, and multi-turn/tool rollout are still deferred.
 
-## Phase 2 Status
+## Phase 3 Progress
 
-The current repo now has the intended Phase 2 usability layer for the local PPO/GRPO core:
+The current repo now has the first serious Phase 3 backend slice:
 
 - grouped rollout balancing is active
 - GRPO is explicit and actor-only
 - reward extras flow through validation and debug artifacts
 - lightweight experiment previews exist without overwhelming metric noise
+- `nanoverl.cli.train_rl` is now the canonical training launcher for debug, HF-local, and FSDP presets
+- the first FSDP path uses rank-aware dataloading, rank-0 logging/checkpointing, and shared validation summaries
 
-The next serious step should move to `Phase 3`, where the question is backend and research-coverage expansion rather than local trainer usability.
+The next serious step should stay within `Phase 3`, but move from the training backend to research-coverage expansion.

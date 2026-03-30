@@ -25,6 +25,7 @@ dev = [
 
 [project.scripts]
 nanoverl-train = "nanoverl.cli.train_rl:main"
+nanoverl-train-rl = "nanoverl.cli.train_rl:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

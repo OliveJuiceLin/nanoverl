@@ -324,6 +324,12 @@ class TrainerConfig:
             raise ConfigError("reference.backend must be 'hf' when actor.backend is 'hf'.")
         if self.actor.backend == "hf" and uses_critic and self.critic.backend != "hf":
             raise ConfigError("critic.backend must be 'hf' when actor.backend is 'hf' and critic is used.")
+        if self.actor.backend == "fsdp" and self.rollout.backend != "hf":
+            raise ConfigError("actor.backend='fsdp' requires rollout.backend='hf'.")
+        if self.actor.backend == "fsdp" and self.reference.enable and self.reference.backend != "fsdp":
+            raise ConfigError("reference.backend must be 'fsdp' when actor.backend is 'fsdp'.")
+        if self.actor.backend == "fsdp" and uses_critic and self.critic.backend != "fsdp":
+            raise ConfigError("critic.backend must be 'fsdp' when actor.backend is 'fsdp' and critic is used.")
         if self.rollout.backend == "hf" and self.model.tokenizer_path is None:
             self.model.tokenizer_path = self.model.path
         if self.rollout.balance_by_length:

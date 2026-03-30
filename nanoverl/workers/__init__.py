@@ -12,7 +12,7 @@ def create_policy_worker(backend: str, model_config, config) -> PolicyWorker:
     if backend == "hf":
         return HFPolicyWorker(model_config, config)
     if backend == "fsdp":
-        return FSDPPolicyWorker(config)
+        return FSDPPolicyWorker(model_config, config)
     raise ValueError("Unknown policy backend: %s" % backend)
 
 
@@ -22,7 +22,7 @@ def create_reference_worker(backend: str, model_config, config) -> ReferenceWork
     if backend == "hf":
         return HFReferenceWorker(model_config, config)
     if backend == "fsdp":
-        return FSDPReferenceWorker(config)
+        return FSDPReferenceWorker(model_config, config)
     raise ValueError("Unknown reference backend: %s" % backend)
 
 
@@ -32,7 +32,7 @@ def create_value_worker(backend: str, model_config, config) -> ValueWorker:
     if backend == "hf":
         return HFValueWorker(model_config, config)
     if backend == "fsdp":
-        return FSDPValueWorker(config)
+        return FSDPValueWorker(model_config, config)
     raise ValueError("Unknown value backend: %s" % backend)
 
 
