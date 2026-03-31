@@ -168,6 +168,10 @@ class RolloutConfig:
         default_factory=lambda: SamplingConfig(temperature=0.0, do_sample=False, n=1)
     )
     balance_by_length: bool = False
+    gpu_memory_utilization: float = 0.5
+    tensor_model_parallel_size: int = 1
+    enforce_eager: bool = False
+    engine_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -318,19 +322,31 @@ class TrainerConfig:
             raise ConfigError("trainer.test_freq requires data.val_path.")
         if self.trainer.validation_dump_freq > 0 and not self.data.val_path:
             raise ConfigError("trainer.validation_dump_freq requires data.val_path.")
-        if self.actor.backend == "hf" and self.rollout.backend != "hf":
-            raise ConfigError("actor.backend='hf' requires rollout.backend='hf'.")
+        if self.actor.backend == "hf" and self.rollout.backend not in {"hf", "vllm"}:
+            raise ConfigError("actor.backend='hf' requires rollout.backend to be 'hf' or 'vllm'.")
         if self.actor.backend == "hf" and self.reference.enable and self.reference.backend != "hf":
             raise ConfigError("reference.backend must be 'hf' when actor.backend is 'hf'.")
         if self.actor.backend == "hf" and uses_critic and self.critic.backend != "hf":
             raise ConfigError("critic.backend must be 'hf' when actor.backend is 'hf' and critic is used.")
-        if self.actor.backend == "fsdp" and self.rollout.backend != "hf":
-            raise ConfigError("actor.backend='fsdp' requires rollout.backend='hf'.")
+        if self.actor.backend == "fsdp" and self.rollout.backend not in {"hf", "vllm"}:
+            raise ConfigError("actor.backend='fsdp' requires rollout.backend to be 'hf' or 'vllm'.")
         if self.actor.backend == "fsdp" and self.reference.enable and self.reference.backend != "fsdp":
             raise ConfigError("reference.backend must be 'fsdp' when actor.backend is 'fsdp'.")
         if self.actor.backend == "fsdp" and uses_critic and self.critic.backend != "fsdp":
             raise ConfigError("critic.backend must be 'fsdp' when actor.backend is 'fsdp' and critic is used.")
-        if self.rollout.backend == "hf" and self.model.tokenizer_path is None:
+        if self.rollout.backend == "vllm":
+            if self.actor.backend == "debug":
+                raise ConfigError("rollout.backend='vllm' requires actor.backend to be 'hf' or 'fsdp'.")
+            if self.rollout.tensor_model_parallel_size <= 0:
+                raise ConfigError("rollout.tensor_model_parallel_size must be positive.")
+            if self.rollout.gpu_memory_utilization <= 0.0 or self.rollout.gpu_memory_utilization > 1.0:
+                raise ConfigError("rollout.gpu_memory_utilization must be in the range (0, 1].")
+            # This guard is new in Phase 3 because the thin vLLM slice keeps one
+            # local rollout engine per trainer process. Wider tensor parallel
+            # rollout needs a larger weight-transfer/runtime design than we want here.
+            if self.rollout.tensor_model_parallel_size != 1:
+                raise ConfigError("rollout.tensor_model_parallel_size is currently supported only for value 1.")
+        if self.rollout.backend in {"hf", "vllm"} and self.model.tokenizer_path is None:
             self.model.tokenizer_path = self.model.path
         if self.rollout.balance_by_length:
             self.trainer.balance_batch = True

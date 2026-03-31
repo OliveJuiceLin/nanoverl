@@ -175,7 +175,7 @@ The repository now includes the first implementation pass of the planned archite
 - `nanoverl.checkpoint.CheckpointManager`
   - local save/resume of trainer and worker state
 
-This is intentionally a clean, readable RL core. The debug and local HF paths are runnable today, and the first single-node FSDP training path now exists as the Phase 3 backend expansion.
+This is intentionally a clean, readable RL core. The debug and local HF paths are runnable today, the first single-node FSDP training path exists, and a thin synchronous `vllm` rollout backend can now be paired with the existing HF or FSDP training workers without changing the trainer loop.
 
 ## Quickstart
 
@@ -197,6 +197,14 @@ Run the first single-node FSDP training preset:
 torchrun --standalone --nproc_per_node=4 -m nanoverl.cli.train_rl --config examples/configs/fsdp_single_node_ppo.json
 ```
 
+Run the local HF actor plus vLLM rollout preset:
+
+```bash
+source /opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh
+conda activate vllm
+python3 -m nanoverl.cli.train_rl --config examples/configs/hf_vllm_local_ppo.json
+```
+
 The packaged CLI aliases are:
 
 ```bash
@@ -216,4 +224,13 @@ The repository is implemented to:
 
 - run the debug path with only the Python standard library
 - keep `torch`/`ray` as explicit optional dependencies in `pyproject.toml`
-- expose a real local HF path and a first single-node FSDP path before adding heavier runtime layers such as Ray
+- expose a real local HF path, a first single-node FSDP path, and a thin synchronous `vllm` rollout path before adding heavier runtime layers such as Ray
+
+The current `vllm` rollout slice is intentionally small:
+
+- synchronous only
+- same rollout contract as the debug and HF engines
+- no async server mode
+- no Ray rollout workers
+- no multi-turn / tool rollout
+- rollout tensor parallel size currently stays at `1` in this thin local design

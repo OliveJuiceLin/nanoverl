@@ -17,7 +17,7 @@ from nanoverl.distributed import TorchDistributedRuntime
 from nanoverl.logging.metrics import compute_data_metrics, compute_throughput_metrics, compute_timing_metrics
 from nanoverl.logging.trackers import TrackingManager
 from nanoverl.reward import RewardManager, load_reward_function
-from nanoverl.rollout import DebugRolloutEngine, HFRolloutEngine, SamplingParams
+from nanoverl.rollout import DebugRolloutEngine, HFRolloutEngine, SamplingParams, VLLMRolloutEngine
 from nanoverl.trainer.artifacts import ArtifactWriter, build_batch_preview_rows
 from nanoverl.trainer.validation import summarize_validation
 from nanoverl.workers import create_policy_worker, create_reference_worker, create_value_worker
@@ -87,6 +87,8 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
         rollout_engine = DebugRolloutEngine(max_response_length=config.rollout.response_length)
     elif config.rollout.backend == "hf":
         rollout_engine = HFRolloutEngine(config.model, config.data, config.rollout)
+    elif config.rollout.backend == "vllm":
+        rollout_engine = VLLMRolloutEngine(config.model, config.data, config.rollout)
     else:
         raise ValueError("Unknown rollout backend: %s" % config.rollout.backend)
     # ========== 构建奖励函数管理器、日志跟踪器和检查点管理器 ==========
@@ -453,7 +455,8 @@ class RLTrainer:
         # 计时、计算、记录数值、记录指标
 
         # 2. 计算旧策略的 log 概率 -> 重要性采样
-        # 这里 policy_worker 和 rollout 的模型的参数实际上是一样的: TODO: 未来可以把这一部分在 rollout_engine.generate() 的时候就计算好并放到 rollout_batch 里，这样就不需要在这里重复计算一次了。
+        # 这里 policy_worker 和 rollout 的模型的参数实际上是一样的: 
+        # TODO: 未来可以把这一部分在 rollout_engine.generate() 的时候就计算好并放到 rollout_batch 里，这样就不需要在这里重复计算一次了。
         t0 = time.time()
         old_log_probs = self.policy_worker.compute_log_probs(rollout_batch)
         rollout_batch.batch["old_log_probs"] = old_log_probs.log_probs
@@ -499,9 +502,9 @@ class RLTrainer:
         # 在 critic_warmup 阶段，训练过程只更新价值函数，而不更新策略。这是为了让价值函数先行学习一个相对稳定的状态值估计，从而在后续的策略更新中提供更准确的优势估计，帮助策略更有效地学习。
         if self.global_step >= self.config.trainer.critic_warmup:
             t0 = time.time()
-            actor_update = self.policy_worker.update(rollout_batch)
+            actor_update = self.policy_worker.update(rollout_batch) # 会更新self.config.ppo_epochs次
             metrics.update({"actor/%s" % key: value for key, value in actor_update.metrics.items()})
-            self.rollout_engine.sync_policy(self.policy_worker.state_dict())
+            self.rollout_engine.sync_policy(self.policy_worker.state_dict()) # 更新结束后同步策略到 rollout_engine 中，以确保在后续的 rollout 过程中使用最新的策略进行生成。
             timing["actor_update"] = time.time() - t0
 
         timing["step"] = time.time() - step_started

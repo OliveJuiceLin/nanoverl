@@ -242,6 +242,13 @@ def count_valid_tokens(response_masks: Sequence[Sequence[int]]) -> int:
 
 
 def get_loss_weight(batch, loss_agg_mode: str) -> float:
+    """
+    Function:
+        - 根据loss_agg_mode的不同，计算并返回一个用于加权损失
+    Ruturn:
+        - 如果loss_agg_mode是"token-mean"，则返回batch中所有response_mask中有效token的总数（即所有response_mask中值为1的元素的数量）。这个值可以用来对损失进行加权，使得损失的平均值是每个有效token的平均损失。
+        - 如果loss_agg_mode不是"token-mean"，则返回batch的长度（即样本数量）。
+    """
     if loss_agg_mode == "token-mean":
         return float(count_valid_tokens(batch.batch["response_mask"]))
     return float(len(batch))

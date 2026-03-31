@@ -23,11 +23,11 @@ from nanoverl.backends.hf import (
 from nanoverl.workers.base import LogProbResult, PolicyWorker, ReferenceWorker, UpdateResult, ValueResult, ValueWorker
 
 
-def _masked_mean(values, mask):
+def _masked_mean(values, mask) -> torch.Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-def _aggregate_loss(loss_matrix, response_mask, loss_agg_mode: str):
+def _aggregate_loss(loss_matrix, response_mask, loss_agg_mode: str) -> torch.Tensor:
     torch, _, _, _ = require_hf_dependencies()
     if loss_agg_mode == "token-mean":
         return _masked_mean(loss_matrix, response_mask)
@@ -38,8 +38,8 @@ def _aggregate_loss(loss_matrix, response_mask, loss_agg_mode: str):
         valid_loss = row_loss[row_mask > 0]
         if valid_loss.numel() == 0:
             continue
-        per_sequence_losses.append(valid_loss.sum())
-        token_counts.append(float(valid_loss.numel()))
+        per_sequence_losses.append(valid_loss.sum()) # 每一行的损失总和，即每个序列的总损失。
+        token_counts.append(float(valid_loss.numel())) # 每一行中有效 token 的数量，即每个序列中参与计算损失的 token 数量。
     if not per_sequence_losses:
         return torch.tensor(0.0, device=loss_matrix.device)
 
@@ -70,15 +70,16 @@ def _compute_policy_loss(
     clip_high = clip_ratio if clip_ratio_high is None else clip_ratio_high
     
     # 采样（Rollout）时当时网络生成的概率对数（$\log \pi_{old}$）。
-    probability_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0).exp()
+    probability_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0).exp() # 计算当前策略和旧策略的概率比值 $\frac{\pi_{new}}{\pi_{old}}$，通过对数概率的差值取指数实现。这里还对差值进行了裁剪，以避免数值不稳定。
     unclipped_loss = -advantages * probability_ratio
-    clipped_ratio = probability_ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high)
-    clipped_loss = -advantages * clipped_ratio
-    clipped_candidate = clipped_loss.maximum(unclipped_loss)
-    lower_clipped_loss = (-advantages * clip_ratio_c).minimum(clipped_candidate)
+    clipped_ratio = probability_ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high) # 对概率比值进行裁剪，使其在 $[1 - \epsilon, 1 + \epsilon]$ 的范围内，其中 $\epsilon$ 是 clip_ratio。这是 PPO 的核心机制之一，旨在限制策略更新的幅度，防止过大的更新导致训练不稳定。
+    clipped_loss = -advantages * clipped_ratio # 计算裁剪后的损失，即使用裁剪后的概率比值来计算损失。
+    clipped_candidate = clipped_loss.maximum(unclipped_loss) # PPO 的损失函数是 unclipped_loss 和 clipped_loss 中的较大者，这样可以确保在概率比值超过裁剪范围时，损失不会继续增加，从而限制了策略更新的幅度。
+    
+    lower_clipped_loss = (-advantages * clip_ratio_c).minimum(clipped_candidate) # 这个部分是对负优势（即新策略表现更差的情况）进行额外的裁剪，防止策略更新过度惩罚那些表现更差的动作。clip_ratio_c 是一个额外的裁剪参数，用于控制这种情况的损失。
     final_loss = clipped_candidate.where(advantages >= 0.0, lower_clipped_loss)
-    masked_loss = final_loss * response_mask
-    aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode)
+    masked_loss = final_loss * response_mask # shape为 (batch_size, max_response_length)，其中每个元素表示对应位置的损失值，如果该位置是有效的响应 token 则为计算得到的损失，否则为0。
+    aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode) # 根据 loss_agg_mode 的不同，对损失进行不同方式的聚合，例如按 token 平均、按序列平均等。
 
     valid_token_count = response_mask.sum().clamp_min(1.0)
     clip_fraction = ((clipped_loss > unclipped_loss).float() * response_mask).sum() / valid_token_count
@@ -253,12 +254,12 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                 if not microbatches:
                     continue
 
-                microbatch_weights = [
+                microbatch_weights: List[float] = [
                     max(get_loss_weight(microbatch, self.config.loss_agg_mode), 1.0) for microbatch in microbatches
-                ]
+                ] # 如果是per_token 的 loss_agg_mode，那么在_compute_policy_loss中计算的损失是micro_batch 上面每个 token 的平均损失，因此为了实现梯度累积这里每一个 micro_batch 的 loss 权重就是这个 micro_batch 中所有 response_mask 中有效 token 的总数。
                 total_weight = sum(microbatch_weights)
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad() # 在对一个 mini-batch 的所有 micro-batch 进行反向传播之前，先将优化器的梯度缓存清零，以避免梯度累积到之前的 mini-batch 中。
                 for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据 PPO 的损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
                     current_log_probs, current_entropy = self._compute_response_log_probs_and_entropy(
                         self.model, microbatch
@@ -297,7 +298,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
 
                 if self.config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
+                self.optimizer.step() # 对一个mini-batch的所有 micro-batch 进行反向传播并累积梯度后，进行一次优化器步骤来更新模型参数。
 
         self.update_steps += 1
         self.model.eval()
