@@ -129,11 +129,11 @@ def pack_prompt_response_tokens(
     max_prompt_length: int,
     max_response_length: int,
 ) -> Dict[str, List[int]]:
-    prompt_ids = truncate_prompt(ensure_prompt_tokens(prompt_token_ids, tokenizer), max_prompt_length)
-    response_ids = truncate_response(response_token_ids, max_response_length)
+    prompt_token_ids = truncate_prompt(ensure_prompt_tokens(prompt_token_ids, tokenizer), max_prompt_length)
+    response_token_ids = truncate_response(response_token_ids, max_response_length)
     return {
-        "prompts": prompt_ids,
-        "responses": response_ids,
+        "prompt_token_ids": prompt_token_ids,
+        "response_token_ids": response_token_ids,
         "input_ids": prompt_ids + response_ids,
         "attention_mask": [1] * (len(prompt_ids) + len(response_ids)),
         "response_mask": [1] * len(response_ids),
@@ -146,11 +146,12 @@ def encode_text(tokenizer, text: str) -> List[int]:
 
 
 def render_prompt_text(tokenizer, prompt_value: Any) -> str:
-    # This helper is new because rollout backends now need to accept either a
-    # plain prompt string or a chat-style prompt payload without duplicating the
-    # chat-template branching logic in every engine.
-    if tokenizer.chat_template is None:
-        return str(prompt_value)
+    # 究竟是使用 template 还是纯字符串取决于数据本身是 str 还是一个符合模板的结构
+    # 换句话说，在数据处理阶段就决定好了模型的输入格式。
+    if isinstance(prompt_value, str):
+        return prompt_value
+    # if tokenizer.chat_template is None:
+    #     return str(prompt_value)
     if isinstance(prompt_value, Mapping):
         prompt_value = [dict(prompt_value)]
     if isinstance(prompt_value, (list, tuple)):
