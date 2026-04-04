@@ -171,7 +171,7 @@ class FSDPPolicyWorker(FSDPWorkerMixin, HFPolicyWorker):
     def __init__(self, model_config, config):
         FSDPWorkerMixin.__init__(self, model_config)
         torch, _, _, _ = require_hf_dependencies()
-        self.config = config
+        self.actor_config = config
         from nanoverl.backends.hf import load_causal_lm
 
         self.model = self._wrap_train_module(load_causal_lm(model_config))
@@ -207,7 +207,7 @@ class FSDPValueWorker(FSDPWorkerMixin, HFValueWorker):
         from nanoverl.backends.hf import load_backbone_model
         from nanoverl.workers.hf import _infer_hidden_size
 
-        self.config = config
+        self.value_config = config
         backbone = load_backbone_model(model_config, path=model_config.critic_path)
         value_head = torch.nn.Linear(_infer_hidden_size(backbone.config), 1)
         self.backbone = self._wrap_train_module(backbone)

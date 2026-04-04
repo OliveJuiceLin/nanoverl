@@ -194,7 +194,8 @@ class FSDPBackendTest(unittest.TestCase):
             before = rollout.generate(RLBatch(non_tensor={"prompt_text": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
             rollout.sync_policy(policy_worker.state_dict())
             after = rollout.generate(RLBatch(non_tensor={"prompt_text": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
-            self.assertEqual(len(before.batch["rollout_log_probs"][0]), len(after.batch["rollout_log_probs"][0]))
+            self.assertEqual(len(before.batch["responses"][0]), len(after.batch["responses"][0]))
+            self.assertLess(before.meta["policy_sync_steps"], after.meta["policy_sync_steps"])
 
     def test_fsdp_fit_resume_and_cli(self):
         with tempfile.TemporaryDirectory() as tmpdir:

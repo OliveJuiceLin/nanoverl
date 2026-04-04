@@ -41,32 +41,8 @@ def build_vllm_sampling_params(sampling: SamplingParams, max_response_length: in
         top_p=sampling.top_p,
         top_k=top_k,
         max_tokens=max_response_length,
-        logprobs=1,
         skip_special_tokens=True,
     )
-
-
-def extract_vllm_chosen_token_log_probs(completion_output) -> List[float]:
-    # This adapter is new in Phase 3 because HF rollout could recover logprobs
-    # from logits directly, while vLLM returns a backend-specific logprob
-    # container that we need to flatten back into the shared rollout contract.
-    response_token_ids = list(completion_output.token_ids)
-    response_logprobs = completion_output.logprobs # shape: (response_length, vocab_size) or None
-    if response_logprobs is None:
-        return [0.0 for _ in response_token_ids]
-
-    flattened_log_probs: List[float] = []
-    for position, token_id in enumerate(response_token_ids):
-        if position >= len(response_logprobs): # 有时候 vLLM 可能会返回比生成的 token 数更短的 logprobs 列表（例如因为某些 token 是特殊 token 被跳过了），这种情况下我们也用 0.0 来填充缺失的 logprob。
-            flattened_log_probs.append(0.0)
-            continue
-        position_log_probs = response_logprobs[position]
-        if position_log_probs is None:
-            flattened_log_probs.append(0.0)
-            continue
-        chosen_token = position_log_probs.get(token_id)
-        flattened_log_probs.append(0.0 if chosen_token is None else float(chosen_token.logprob))
-    return flattened_log_probs
 
 
 def build_vllm_ipc_weight_update_request(
@@ -115,6 +91,5 @@ __all__ = [
     "MissingDependencyError",
     "build_vllm_ipc_weight_update_request",
     "build_vllm_sampling_params",
-    "extract_vllm_chosen_token_log_probs",
     "require_vllm_dependencies",
 ]

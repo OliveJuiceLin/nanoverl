@@ -115,6 +115,7 @@ class AlgorithmConfig:
 @dataclass
 class ActorConfig:
     backend: str = "debug"
+    device: Optional[str] = None
     ppo_mini_batch_size: int = 2
     ppo_epochs: int = 1
     micro_batch_size: Optional[int] = None
@@ -138,6 +139,7 @@ class ActorConfig:
 @dataclass
 class CriticConfig:
     backend: str = "debug"
+    device: Optional[str] = None
     enable: bool = True
     ppo_mini_batch_size: int = 2
     ppo_epochs: int = 1
@@ -155,6 +157,7 @@ class CriticConfig:
 @dataclass
 class ReferenceConfig:
     backend: str = "debug"
+    device: Optional[str] = None
     enable: bool = True
     fixed_kl_offset: float = -0.15
 
@@ -162,6 +165,7 @@ class ReferenceConfig:
 @dataclass
 class RolloutConfig:
     backend: str = "debug"
+    device: Optional[str] = None
     response_length: int = 64
     train: SamplingConfig = field(default_factory=SamplingConfig)
     validation: SamplingConfig = field(

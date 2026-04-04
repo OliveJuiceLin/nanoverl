@@ -205,6 +205,13 @@ conda activate vllm
 python3 -m nanoverl.cli.train_rl --config examples/configs/hf_vllm_local_ppo.json
 ```
 
+Run the GSM8K GRPO example with explicit local device placement:
+
+```bash
+python3 examples/data_preprocess/gsm8k.py --local_save_dir examples/GSM8K/processed
+python3 -m nanoverl.cli.train_rl --config examples/configs/Qwen2.5-0.8B-GSM8K-GRPO.json
+```
+
 The packaged CLI aliases are:
 
 ```bash
@@ -229,8 +236,47 @@ The repository is implemented to:
 The current `vllm` rollout slice is intentionally small:
 
 - synchronous only
-- same rollout contract as the debug and HF engines
+- same rollout contract as the real HF engine
 - no async server mode
 - no Ray rollout workers
 - no multi-turn / tool rollout
 - rollout tensor parallel size currently stays at `1` in this thin local design
+
+## Data And Device Notes
+
+The built-in loader currently expects `.json` or `.jsonl` rows. The most useful fields are:
+
+- `prompt`
+- `expected_response`
+- `data_source`
+- `reward_model`
+- `extra_info`
+
+`prompt` can be either:
+
+- a plain string, or
+- a chat-style message list when the tokenizer provides a chat template
+
+Real HF and vLLM rollout engines now return:
+
+- `prompts`
+- `responses`
+- `input_ids`
+- `attention_mask`
+- `response_mask`
+- `response_text`
+
+They do not compute `rollout_log_probs`; the trainer recomputes `old_log_probs` through the policy worker.
+
+For local HF execution, you can now place components explicitly:
+
+```json
+{
+  "actor": {"backend": "hf", "device": "cuda:0"},
+  "reference": {"backend": "hf", "device": "cuda:0"},
+  "critic": {"backend": "hf", "device": "cuda:0"},
+  "rollout": {"backend": "hf", "device": "cuda:1"}
+}
+```
+
+For `fsdp`, actor/reference/critic placement is still rank-owned by the distributed runtime, so only local rollout device placement is relevant there.

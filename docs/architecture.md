@@ -54,8 +54,9 @@ flowchart LR
   - `input_ids`
   - `attention_mask`
   - `response_mask`
-  - `rollout_log_probs`
   - `response_text`
+- `rollout_log_probs` is now debug-backend-only compatibility data.
+  - Real HF and vLLM rollouts do not compute it because the trainer already recomputes `old_log_probs` from the policy worker.
 - The trainer still owns the PPO ordering:
   - rollout
   - reward

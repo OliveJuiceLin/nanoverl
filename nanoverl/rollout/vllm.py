@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from nanoverl.backends.hf import encode_text, load_tokenizer, pack_prompt_response_tokens
+from nanoverl.backends.hf import (
+    encode_text,
+    load_tokenizer,
+    pack_prompt_response_tokens,
+    render_prompt_text,
+    resolve_device,
+    trim_generated_response,
+)
 from nanoverl.backends.vllm import (
     build_vllm_ipc_weight_update_request,
     build_vllm_sampling_params,
-    extract_vllm_chosen_token_log_probs,
     require_vllm_dependencies,
 )
 from nanoverl.core.batch import RLBatch
@@ -29,8 +35,15 @@ class VLLMRolloutEngine(RolloutEngine):
         if not torch.cuda.is_available():
             raise RuntimeError("The thin vLLM rollout backend currently requires CUDA.")
 
+        # This device hook is new because the earlier local rollout path assumed
+        # the process-wide current CUDA device. For single-process experiments we
+        # still keep vLLM thin, but now we can pin it to one explicit local GPU.
+        self.sync_device = resolve_device(rollout_config.device or "cuda")
+        if self.sync_device.type != "cuda":
+            raise RuntimeError("The thin vLLM rollout backend currently requires a CUDA rollout.device.")
+        torch.cuda.set_device(self.sync_device)
+
         engine_kwargs = dict(rollout_config.engine_kwargs)
-        self.sync_device = torch.device("cuda", torch.cuda.current_device())
         self.llm = llm_cls(
             model=model_config.path,
             tokenizer=model_config.tokenizer_path or model_config.path,
@@ -47,13 +60,16 @@ class VLLMRolloutEngine(RolloutEngine):
     def generate(self, batch: RLBatch, sampling) -> RLBatch:
         # This method is new in Phase 3 because rollout can now come from vLLM
         # while the trainer, reward path, and worker contracts stay unchanged.
-        prompt_texts: List[str] = batch.non_tensor.get("prompt_text") or batch.non_tensor.get("prompt")
-        if prompt_texts is None:
+        prompt_values = batch.non_tensor.get("prompt")
+        if prompt_values is None:
+            prompt_values = batch.non_tensor.get("prompt_text")
+        if prompt_values is None:
             raise ValueError("Rollout requires prompt_text or prompt in batch.non_tensor.")
 
         prompt_token_rows: List[List[int]] = []
         prompt_inputs: List[Dict[str, List[int]]] = []
-        for prompt_text in prompt_texts:
+        for prompt_value in prompt_values:
+            prompt_text = render_prompt_text(self.tokenizer, prompt_value)
             packed_prompt = pack_prompt_response_tokens(
                 tokenizer=self.tokenizer,
                 prompt_token_ids=encode_text(self.tokenizer, str(prompt_text)),
@@ -71,23 +87,18 @@ class VLLMRolloutEngine(RolloutEngine):
 
         packed_rows = []
         response_texts = []
-        rollout_log_prob_rows = []
         for row_index, request_output in enumerate(request_outputs):
             completion_output = request_output.outputs[0]
             packed_row = pack_prompt_response_tokens(
                 tokenizer=self.tokenizer,
                 prompt_token_ids=prompt_token_rows[row_index],
-                response_token_ids=list(completion_output.token_ids),
+                response_token_ids=trim_generated_response(self.tokenizer, completion_output.token_ids),
                 max_prompt_length=self.data_config.max_prompt_length,
                 max_response_length=self.rollout_config.response_length,
             )
             packed_rows.append(packed_row)
             response_texts.append(
                 self.tokenizer.decode(packed_row["responses"], skip_special_tokens=True).strip()
-            )
-            response_length = len(packed_row["responses"])
-            rollout_log_prob_rows.append(
-                extract_vllm_chosen_token_log_probs(completion_output)[:response_length]
             )
 
         rollout_batch = RLBatch(
@@ -97,7 +108,6 @@ class VLLMRolloutEngine(RolloutEngine):
                 "input_ids": [row["input_ids"] for row in packed_rows],
                 "attention_mask": [row["attention_mask"] for row in packed_rows],
                 "response_mask": [row["response_mask"] for row in packed_rows],
-                "rollout_log_probs": rollout_log_prob_rows,
             },
             non_tensor={"response_text": response_texts},
             meta={"policy_sync_steps": self.policy_sync_steps},

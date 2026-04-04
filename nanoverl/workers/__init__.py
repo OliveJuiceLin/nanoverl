@@ -26,13 +26,13 @@ def create_reference_worker(backend: str, model_config, ref_config) -> Reference
     raise ValueError("Unknown reference backend: %s" % backend)
 
 
-def create_value_worker(backend: str, model_config, config) -> ValueWorker:
+def create_value_worker(backend: str, model_config, critic_config) -> ValueWorker:
     if backend == "debug":
-        return DebugValueWorker(value_config)
+        return DebugValueWorker(critic_config)
     if backend == "hf":
-        return HFValueWorker(model_config, value_config)
+        return HFValueWorker(model_config, critic_config)
     if backend == "fsdp":
-        return FSDPValueWorker(model_config, value_config)
+        return FSDPValueWorker(model_config, critic_config)
     raise ValueError("Unknown value backend: %s" % backend)
 
 

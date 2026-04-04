@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the GSM8k dataset to parquet format
+Preprocess GSM8K into the JSONL format expected by nanoverl.
 
 # 原始样本可能是:
 # {
@@ -89,7 +89,9 @@ if __name__ == "__main__":
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            # 将简单的问答对格式转换为包含完整元数据的结构化格式
+            # This script keeps the prompt in chat-message form so instruct
+            # tokenizers with a built-in chat template can render it correctly
+            # during rollout, while still fitting the built-in JSONL loader.
             question_raw = example.pop("question")
 
             question = question_raw + " " + instruction_following

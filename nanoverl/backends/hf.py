@@ -51,6 +51,16 @@ def get_default_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def resolve_device(device_name: Optional[str] = None):
+    # This helper is new because the earlier local backend assumed one default
+    # device for every HF component. Once actor, reference, critic, and rollout
+    # may live on different local devices, device resolution needs one shared path.
+    torch, _, _, _ = require_hf_dependencies()
+    if not device_name:
+        return get_default_device()
+    return torch.device(device_name)
+
+
 def load_tokenizer(model_config):
     _, _, _, auto_tokenizer = require_hf_dependencies()
     tokenizer_path = model_config.tokenizer_path or model_config.path
@@ -133,6 +143,34 @@ def pack_prompt_response_tokens(
 def encode_text(tokenizer, text: str) -> List[int]:
     encoded = tokenizer(text, add_special_tokens=False)
     return list(encoded["input_ids"])
+
+
+def render_prompt_text(tokenizer, prompt_value: Any) -> str:
+    # This helper is new because rollout backends now need to accept either a
+    # plain prompt string or a chat-style prompt payload without duplicating the
+    # chat-template branching logic in every engine.
+    if tokenizer.chat_template is None:
+        return str(prompt_value)
+    if isinstance(prompt_value, Mapping):
+        prompt_value = [dict(prompt_value)]
+    if isinstance(prompt_value, (list, tuple)):
+        return str(tokenizer.apply_chat_template(prompt_value, tokenize=False, add_generation_prompt=True))
+    return str(prompt_value)
+
+
+def trim_generated_response(tokenizer, response_token_ids: Sequence[int]) -> List[int]:
+    # This helper is new because the earlier rollout path treated everything
+    # after the prompt as valid response tokens. Real generation needs one place
+    # to stop at EOS and ignore post-generation padding.
+    trimmed = list(response_token_ids)
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    if eos_token_id is not None and eos_token_id in trimmed:
+        trimmed = trimmed[: trimmed.index(eos_token_id) + 1]
+    if pad_token_id is not None and pad_token_id != eos_token_id:
+        while trimmed and trimmed[-1] == pad_token_id:
+            trimmed.pop()
+    return trimmed
 
 
 def pad_rows(rows: Sequence[Sequence[Any]], pad_value: Any, padding_side: str = "right") -> List[List[Any]]:

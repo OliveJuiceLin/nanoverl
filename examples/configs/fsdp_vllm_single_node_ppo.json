@@ -43,6 +43,7 @@
   },
   "rollout": {
     "backend": "vllm",
+    "device": "cuda:0",
     "response_length": 64,
     "gpu_memory_utilization": 0.5,
     "tensor_model_parallel_size": 1,

@@ -192,6 +192,44 @@ class HFBackendTest(unittest.TestCase):
             self.assertEqual(packed["input_ids"], packed["prompts"] + packed["responses"])
             self.assertEqual(packed["response_mask"], [1, 1])
 
+    def test_rollout_supports_chat_template_prompts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model_dir = self._make_model_dir(root)
+            chat_template_path = root / "chat_template.jinja"
+            chat_template_path.write_text(
+                "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+                "{% if add_generation_prompt %}assistant: {% endif %}",
+                encoding="utf-8",
+            )
+            config = TrainerConfig.from_dict(
+                {
+                    "model": {
+                        "path": str(model_dir),
+                        "tokenizer_path": str(model_dir),
+                        "dtype": "float32",
+                        "chat_template_path": str(chat_template_path),
+                    },
+                    "data": {"max_prompt_length": 16},
+                    "actor": {"backend": "hf", "ppo_mini_batch_size": 1},
+                    "critic": {"enable": False},
+                    "reference": {"enable": False},
+                    "rollout": {"backend": "hf", "response_length": 4, "device": "cpu"},
+                }
+            )
+            rollout = HFRolloutEngine(config.model, config.data, config.rollout)
+            rollout_batch = rollout.generate(
+                RLBatch(
+                    non_tensor={
+                        "prompt": [[{"role": "user", "content": "say yes"}]],
+                    }
+                ),
+                SamplingParams(do_sample=False, temperature=0.0, n=1),
+            )
+            self.assertIn("response_text", rollout_batch.non_tensor)
+            self.assertEqual(len(rollout_batch.batch["responses"]), 1)
+            self.assertLessEqual(len(rollout_batch.batch["responses"][0]), 4)
+
     def test_policy_and_value_shapes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             model_dir = self._make_model_dir(Path(tmpdir))
@@ -241,6 +279,25 @@ class HFBackendTest(unittest.TestCase):
             rollout.sync_policy(policy_worker.state_dict())
             synced_rollout_parameter = next(rollout.model.parameters()).detach().clone()
             self.assertFalse(torch.equal(first_rollout_parameter, synced_rollout_parameter))
+
+    def test_local_hf_components_can_use_explicit_devices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = self._make_model_dir(Path(tmpdir))
+            config = TrainerConfig.from_dict(
+                {
+                    "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                    "actor": {"backend": "hf", "device": "cpu", "ppo_mini_batch_size": 1},
+                    "critic": {"backend": "hf", "device": "cpu", "enable": True, "ppo_mini_batch_size": 1},
+                    "reference": {"backend": "hf", "device": "cpu", "enable": True},
+                    "rollout": {"backend": "hf", "device": "cpu", "response_length": 4},
+                }
+            )
+            policy_worker = HFPolicyWorker(config.model, config.actor)
+            value_worker = HFValueWorker(config.model, config.critic)
+            rollout_engine = HFRolloutEngine(config.model, config.data, config.rollout)
+            self.assertEqual(str(policy_worker.device), "cpu")
+            self.assertEqual(str(value_worker.device), "cpu")
+            self.assertEqual(str(rollout_engine.device), "cpu")
 
     def test_hf_fit_and_resume(self):
         with tempfile.TemporaryDirectory() as tmpdir:

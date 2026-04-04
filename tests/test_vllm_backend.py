@@ -212,12 +212,10 @@ class VLLMBackendTest(unittest.TestCase):
                 "input_ids",
                 "attention_mask",
                 "response_mask",
-                "rollout_log_probs",
             ):
                 self.assertIn(field_name, rollout_batch.batch)
             self.assertIn("response_text", rollout_batch.non_tensor)
             self.assertEqual(len(rollout_batch.batch["responses"]), 1)
-            self.assertEqual(len(rollout_batch.batch["rollout_log_probs"][0]), len(rollout_batch.batch["responses"][0]))
 
     def test_sync_policy_changes_rollout_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -11,13 +11,13 @@ from nanoverl.backends.hf import (
     build_training_tensors,
     clone_model_state,
     extract_response_stats,
-    get_default_device,
     get_loss_weight,
     get_prompt_lengths,
     get_response_lengths,
     load_backbone_model,
     load_causal_lm,
     require_hf_dependencies,
+    resolve_device,
     tensor_to_list_rows,
 )
 from nanoverl.workers.base import LogProbResult, PolicyWorker, ReferenceWorker, UpdateResult, ValueResult, ValueWorker
@@ -127,9 +127,9 @@ def _infer_hidden_size(backbone_config) -> int:
 
 
 class HFWorkerBase:
-    def __init__(self, model_config):
+    def __init__(self, model_config, device_name: Optional[str] = None):
         self.model_config = model_config
-        self.device = get_default_device()
+        self.device = resolve_device(device_name)
 
     def _build_model_inputs(self, batch):
         """
@@ -181,7 +181,7 @@ class HFWorkerBase:
 
 class HFReferenceWorker(HFWorkerBase, ReferenceWorker):
     def __init__(self, model_config, ref_config):
-        super().__init__(model_config)
+        super().__init__(model_config, device_name=ref_config.device)
         self.ref_config = ref_config
         self.model = load_causal_lm(model_config).to(self.device)
         self.model.eval()
@@ -209,7 +209,7 @@ class HFReferenceWorker(HFWorkerBase, ReferenceWorker):
 
 class HFPolicyWorker(HFWorkerBase, PolicyWorker):
     def __init__(self, model_config, actor_config):
-        super().__init__(model_config)
+        super().__init__(model_config, device_name=actor_config.device)
         torch, _, _, _ = require_hf_dependencies()
         self.actor_config = actor_config
         self.model = load_causal_lm(model_config).to(self.device)
@@ -325,17 +325,17 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
 
 class HFValueWorker(HFWorkerBase, ValueWorker):
     def __init__(self, model_config, value_config):
-        super().__init__(model_config)
+        super().__init__(model_config, device_name=value_config.device)
         torch, _, _, _ = require_hf_dependencies()
         self.value_config = value_config
         self.backbone = load_backbone_model(model_config, path=model_config.critic_path).to(self.device)
         self.value_head = torch.nn.Linear(_infer_hidden_size(self.backbone.config), 1).to(self.device)
         self.optimizer = torch.optim.AdamW(
             list(self.backbone.parameters()) + list(self.value_head.parameters()),
-            lr=config.lr,
-            betas=tuple(config.betas),
-            eps=config.eps,
-            weight_decay=config.weight_decay,
+            lr=value_config.lr,
+            betas=tuple(value_config.betas),
+            eps=value_config.eps,
+            weight_decay=value_config.weight_decay,
         )
         self.update_steps = 0
 

@@ -22,6 +22,7 @@
   },
   "actor": {
     "backend": "hf",
+    "device": "cuda:0",
     "ppo_mini_batch_size": 1,
     "ppo_epochs": 1,
     "micro_batch_size": 1,
@@ -30,6 +31,7 @@
   },
   "critic": {
     "backend": "hf",
+    "device": "cuda:0",
     "enable": true,
     "ppo_mini_batch_size": 1,
     "ppo_epochs": 1,
@@ -39,10 +41,12 @@
   },
   "reference": {
     "backend": "hf",
+    "device": "cuda:0",
     "enable": true
   },
   "rollout": {
     "backend": "vllm",
+    "device": "cuda:0",
     "response_length": 64,
     "gpu_memory_utilization": 0.5,
     "tensor_model_parallel_size": 1,
