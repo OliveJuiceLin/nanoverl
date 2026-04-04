@@ -180,9 +180,9 @@ class HFWorkerBase:
 
 
 class HFReferenceWorker(HFWorkerBase, ReferenceWorker):
-    def __init__(self, model_config, config):
+    def __init__(self, model_config, ref_config):
         super().__init__(model_config)
-        self.config = config
+        self.ref_config = ref_config
         self.model = load_causal_lm(model_config).to(self.device)
         self.model.eval()
         for parameter in self.model.parameters():
@@ -208,17 +208,17 @@ class HFReferenceWorker(HFWorkerBase, ReferenceWorker):
 
 
 class HFPolicyWorker(HFWorkerBase, PolicyWorker):
-    def __init__(self, model_config, config):
+    def __init__(self, model_config, actor_config):
         super().__init__(model_config)
         torch, _, _, _ = require_hf_dependencies()
-        self.config = config
+        self.actor_config = actor_config
         self.model = load_causal_lm(model_config).to(self.device)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=config.lr,
-            betas=tuple(config.betas),
-            eps=config.eps,
-            weight_decay=config.weight_decay,
+            lr=actor_config.lr,
+            betas=tuple(actor_config.betas),
+            eps=actor_config.eps,
+            weight_decay=actor_config.weight_decay,
         )
         self.update_steps = 0
 
@@ -247,15 +247,15 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
         metric_history: Dict[str, List[float]] = {}
         self.model.train()
 
-        for _ in range(self.config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
-            minibatches = self._iter_minibatches(batch, self.config.ppo_mini_batch_size, self.config.shuffle)
+        for _ in range(self.actor_config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
+            minibatches = self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, self.actor_config.shuffle)
             for minibatch in minibatches: # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
-                microbatches = list(self._iter_microbatches(minibatch, self.config.micro_batch_size))
+                microbatches = list(self._iter_microbatches(minibatch, self.actor_config.micro_batch_size))
                 if not microbatches:
                     continue
 
                 microbatch_weights: List[float] = [
-                    max(get_loss_weight(microbatch, self.config.loss_agg_mode), 1.0) for microbatch in microbatches
+                    max(get_loss_weight(microbatch, self.actor_config.loss_agg_mode), 1.0) for microbatch in microbatches
                 ] # 如果是per_token 的 loss_agg_mode，那么在_compute_policy_loss中计算的损失是micro_batch 上面每个 token 的平均损失，因此为了实现梯度累积这里每一个 micro_batch 的 loss 权重就是这个 micro_batch 中所有 response_mask 中有效 token 的总数。
                 total_weight = sum(microbatch_weights)
 
@@ -270,24 +270,24 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                         old_log_probs=training_tensors["old_log_probs"],
                         advantages=training_tensors["advantages"],
                         response_mask=training_tensors["response_mask"],
-                        clip_ratio=self.config.clip_ratio,
-                        clip_ratio_low=self.config.clip_ratio_low,
-                        clip_ratio_high=self.config.clip_ratio_high,
-                        clip_ratio_c=self.config.clip_ratio_c,
-                        loss_agg_mode=self.config.loss_agg_mode,
+                        clip_ratio=self.actor_config.clip_ratio,
+                        clip_ratio_low=self.actor_config.clip_ratio_low,
+                        clip_ratio_high=self.actor_config.clip_ratio_high,
+                        clip_ratio_c=self.actor_config.clip_ratio_c,
+                        loss_agg_mode=self.actor_config.loss_agg_mode,
                     )
                     entropy_bonus = _masked_mean(current_entropy, training_tensors["response_mask"])
-                    total_loss = policy_loss - (self.config.entropy_coeff * entropy_bonus)
+                    total_loss = policy_loss - (self.actor_config.entropy_coeff * entropy_bonus)
                     step_metrics["policy_entropy"] = float(entropy_bonus.detach().cpu())
 
-                    if self.config.use_kl_loss and "ref_log_probs" in microbatch.batch:
+                    if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
                         kl_penalty = _compute_kl_penalty(
                             current_log_probs,
                             training_tensors["ref_log_probs"],
                             mode="low_var_kl",
                         )
                         kl_mean = _masked_mean(kl_penalty, training_tensors["response_mask"])
-                        total_loss = total_loss + (self.config.kl_loss_coef * kl_mean)
+                        total_loss = total_loss + (self.actor_config.kl_loss_coef * kl_mean)
                         step_metrics["actor_kl_loss"] = float(kl_mean.detach().cpu())
 
                     scaled_loss = total_loss * (microbatch_weight / max(total_weight, 1.0))
@@ -296,8 +296,8 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                     for metric_name, metric_value in step_metrics.items():
                         metric_history.setdefault(metric_name, []).append(float(metric_value))
 
-                if self.config.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                if self.actor_config.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.actor_config.max_grad_norm)
                 self.optimizer.step() # 对一个mini-batch的所有 micro-batch 进行反向传播并累积梯度后，进行一次优化器步骤来更新模型参数。
 
         self.update_steps += 1
@@ -324,10 +324,10 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
 
 
 class HFValueWorker(HFWorkerBase, ValueWorker):
-    def __init__(self, model_config, config):
+    def __init__(self, model_config, value_config):
         super().__init__(model_config)
         torch, _, _, _ = require_hf_dependencies()
-        self.config = config
+        self.value_config = value_config
         self.backbone = load_backbone_model(model_config, path=model_config.critic_path).to(self.device)
         self.value_head = torch.nn.Linear(_infer_hidden_size(self.backbone.config), 1).to(self.device)
         self.optimizer = torch.optim.AdamW(
@@ -374,15 +374,15 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
         self.backbone.train()
         self.value_head.train()
 
-        for _ in range(self.config.ppo_epochs):
-            minibatches = self._iter_minibatches(batch, self.config.ppo_mini_batch_size, self.config.shuffle)
+        for _ in range(self.value_config.ppo_epochs):
+            minibatches = self._iter_minibatches(batch, self.value_config.ppo_mini_batch_size, self.value_config.shuffle)
             for minibatch in minibatches:
-                microbatches = list(self._iter_microbatches(minibatch, self.config.micro_batch_size))
+                microbatches = list(self._iter_microbatches(minibatch, self.value_config.micro_batch_size))
                 if not microbatches:
                     continue
 
                 microbatch_weights = [
-                    max(get_loss_weight(microbatch, self.config.loss_agg_mode), 1.0) for microbatch in microbatches
+                    max(get_loss_weight(microbatch, self.value_config.loss_agg_mode), 1.0) for microbatch in microbatches
                 ]
                 total_weight = sum(microbatch_weights)
 
@@ -394,8 +394,8 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
                         values=predicted_values,
                         returns=training_tensors["returns"],
                         response_mask=training_tensors["response_mask"],
-                        cliprange_value=self.config.cliprange_value,
-                        loss_agg_mode=self.config.loss_agg_mode,
+                        cliprange_value=self.value_config.cliprange_value,
+                        loss_agg_mode=self.value_config.loss_agg_mode,
                     )
                     scaled_loss = value_loss * (microbatch_weight / max(total_weight, 1.0))
                     scaled_loss.backward()
@@ -403,10 +403,10 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
                     for metric_name, metric_value in step_metrics.items():
                         metric_history.setdefault(metric_name, []).append(float(metric_value))
 
-                if self.config.max_grad_norm > 0:
+                if self.value_config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
                         list(self.backbone.parameters()) + list(self.value_head.parameters()),
-                        self.config.max_grad_norm,
+                        self.value_config.max_grad_norm,
                     )
                 self.optimizer.step()
 

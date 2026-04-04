@@ -456,7 +456,6 @@ class RLTrainer:
 
         # 2. 计算旧策略的 log 概率 -> 重要性采样
         # 这里 policy_worker 和 rollout 的模型的参数实际上是一样的: 
-        # TODO: 未来可以把这一部分在 rollout_engine.generate() 的时候就计算好并放到 rollout_batch 里，这样就不需要在这里重复计算一次了。
         t0 = time.time()
         old_log_probs = self.policy_worker.compute_log_probs(rollout_batch)
         rollout_batch.batch["old_log_probs"] = old_log_probs.log_probs
