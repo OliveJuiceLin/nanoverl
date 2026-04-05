@@ -71,7 +71,6 @@ def _coerce_dataclass(cls: Type[T], value: Any) -> T:
 class DataConfig:
     train_path: str = "examples/data/debug_prompts.jsonl"
     val_path: Optional[str] = "examples/data/debug_prompts.jsonl"
-    prompt_key: str = "prompt"
     train_batch_size: int = 2
     val_batch_size: int = 2
     shuffle: bool = True

@@ -1,7 +1,7 @@
 import re
 
 def extract_final_answer(text: str) -> str | None:
-    match = re.search(r"####\s*([\-0-9\.,]+)", text)
+    match = re.search(r"####\s*([\-0-9\.,]+)", text) # 找到以 #### 开头，后面跟着的一串代表数字的字符串（包括负号、数字、逗点或小数点）
     if match is None:
         return None
     return match.group(1).replace(",", "").strip()

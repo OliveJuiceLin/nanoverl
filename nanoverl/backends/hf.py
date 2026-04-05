@@ -141,8 +141,10 @@ def pack_prompt_response_tokens(
 
 
 def encode_text(tokenizer, text: str) -> List[int]:
-    encoded = tokenizer(text, add_special_tokens=False)
-    return list(encoded["input_ids"])
+    # encoded = tokenizer(text, add_special_tokens=False)
+    # return list(encoded["input_ids"])
+    # 更简洁的实现：
+    return tokenizer.encode(text, add_special_tokens=False)
 
 
 def render_prompt_text(tokenizer, prompt_value: Any) -> str:
@@ -251,10 +253,10 @@ def extract_response_stats(
     token_log_normalizers = torch.logsumexp(shifted_logits, dim=-1) # shape为 (batch_size, sequence_length - 1)
     selected_target_logits = torch.gather(shifted_logits, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
     target_log_probs = selected_target_logits - token_log_normalizers
-
+    # 取出对应response部分的log_prob，shape为 (batch_size, max_response_length)，其中max_response_length是response_token_counts中的最大值
     batch_size = input_ids.shape[0]
     max_response_length = max(response_token_counts, default=0)
-    response_log_probs = target_log_probs.new_zeros((batch_size, max_response_length))
+    response_log_probs = target_log_probs.new_zeros((batch_size, max_response_length)) # 继承数据类型和设备
     response_entropy = None
     token_entropy = None
     if compute_entropy:

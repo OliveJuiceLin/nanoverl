@@ -70,16 +70,17 @@ def _compute_policy_loss(
     clip_low = clip_ratio if clip_ratio_low is None else clip_ratio_low
     clip_high = clip_ratio if clip_ratio_high is None else clip_ratio_high
     
-    # 采样（Rollout）时当时网络生成的概率对数（$\log \pi_{old}$）。
-    probability_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0).exp() # 计算当前策略和旧策略的概率比值 $\frac{\pi_{new}}{\pi_{old}}$，通过对数概率的差值取指数实现。这里还对差值进行了裁剪，以避免数值不稳定。
+    # 计算当前策略和旧策略的概率比值 $\frac{\pi_{new}}{\pi_{old}}$，通过对数概率的差值取指数实现。这里还对差值进行了裁剪，以避免数值不稳定。只在差别过大时候才进行裁剪，正常情况下如果差别不大，裁剪不会有任何影响。
+    # probability_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0).exp() 
+    probability_ratio = (current_log_probs - old_log_probs).exp()
     unclipped_loss = -advantages * probability_ratio
     clipped_ratio = probability_ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high) # 对概率比值进行裁剪，使其在 $[1 - \epsilon, 1 + \epsilon]$ 的范围内，其中 $\epsilon$ 是 clip_ratio。这是 PPO 的核心机制之一，旨在限制策略更新的幅度，防止过大的更新导致训练不稳定。
     clipped_loss = -advantages * clipped_ratio # 计算裁剪后的损失，即使用裁剪后的概率比值来计算损失。
     clipped_candidate = clipped_loss.maximum(unclipped_loss) # PPO 的损失函数是 unclipped_loss 和 clipped_loss 中的较大者，这样可以确保在概率比值超过裁剪范围时，损失不会继续增加，从而限制了策略更新的幅度。
     
     lower_clipped_loss = (-advantages * clip_ratio_c).minimum(clipped_candidate) # 这个部分是对负优势（即新策略表现更差的情况）进行额外的裁剪，防止策略更新过度惩罚那些表现更差的动作。clip_ratio_c 是一个额外的裁剪参数，用于控制这种情况的损失。
-    final_loss = clipped_candidate.where(advantages >= 0.0, lower_clipped_loss)
-    masked_loss = final_loss * response_mask # shape为 (batch_size, max_response_length)，其中每个元素表示对应位置的损失值，如果该位置是有效的响应 token 则为计算得到的损失，否则为0。
+    final_loss = clipped_candidate.where(advantages >= 0.0, lower_clipped_loss) # 如果优势大于等于 0（表现好于平均）：说明这是一个好动作，我们希望新策略尽量提高它的出现概率。此时不需要什么“最大惩罚上限”，直接使用常规的截断损失；如果优势小于 0（表现差于平均）：触发保护机制，如果惩罚过大就会被 lower_clipped_loss 截断，防止梯度被单一极端的负优势样本主导。
+    masked_loss = final_loss * response_mask # TODO: 本身传入的张量shape为 (batch_size, max_response_length)对应 response 部分了，不需要再乘以 response_mask 了，直接 masked_loss = final_loss 就行了，未来可以简化逻辑
     aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode) # 根据 loss_agg_mode 的不同，对损失进行不同方式的聚合，例如按 token 平均、按序列平均等。
 
     valid_token_count = response_mask.sum().clamp_min(1.0)

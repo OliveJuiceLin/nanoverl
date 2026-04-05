@@ -2,7 +2,6 @@
   "data": {
     "train_path": "examples/data/debug_prompts.jsonl",
     "val_path": "examples/data/debug_prompts.jsonl",
-    "prompt_key": "prompt",
     "train_batch_size": 4,
     "val_batch_size": 4,
     "shuffle": false,

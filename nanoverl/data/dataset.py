@@ -44,12 +44,6 @@ class JsonDataset:
         return self.rows[index]
 
 
-def collate_rows(rows: Sequence[Mapping[str, Any]], prompt_key: str = "prompt") -> RLBatch:
-    batch = RLBatch.from_rows(rows)
-    if prompt_key in batch.non_tensor and "prompt_text" not in batch.non_tensor:
-        batch.non_tensor["prompt_text"] = list(batch.non_tensor[prompt_key])
-    return batch
-
 
 @dataclass
 class StatefulIndexSampler:
@@ -117,7 +111,6 @@ class StatefulDataLoader:
         self,
         dataset: JsonDataset,
         batch_size: int,
-        prompt_key: str = "prompt",
         shuffle: bool = False,
         seed: Optional[int] = None,
         drop_last: bool = True,
@@ -126,7 +119,6 @@ class StatefulDataLoader:
     ):
         self.dataset = dataset
         self.batch_size = batch_size
-        self.prompt_key = prompt_key
         self.drop_last = drop_last
         self.rank = rank
         self.world_size = world_size
@@ -149,11 +141,11 @@ class StatefulDataLoader:
         return self.sampler.epoch
 
     def next_batch(self) -> Optional[RLBatch]:
-        indices = self.sampler.next_indices(self.batch_size, drop_last=self.drop_last)
+        indices = self.sampler.next_indices(self.batch_size, drop_last=self.drop_last) # [22, 34, ...]
         if indices is None:
             return None
-        rows = [self.dataset[index] for index in indices]
-        return collate_rows(rows, prompt_key=self.prompt_key)
+        rows = [self.dataset[index] for index in indices] # [{}, {}, {}, ...]
+        return RLBatch.from_rows(rows)
 
     def reset_for_new_epoch(self) -> None:
         self.sampler.reset_for_new_epoch()
@@ -161,7 +153,6 @@ class StatefulDataLoader:
     def state_dict(self) -> Dict[str, Any]:
         return {
             "batch_size": self.batch_size,
-            "prompt_key": self.prompt_key,
             "drop_last": self.drop_last,
             "rank": self.rank,
             "world_size": self.world_size,
@@ -172,4 +163,4 @@ class StatefulDataLoader:
         self.sampler.load_state_dict(state["sampler"])
 
 
-__all__ = ["JsonDataset", "StatefulDataLoader", "collate_rows"]
+__all__ = ["JsonDataset", "StatefulDataLoader"]

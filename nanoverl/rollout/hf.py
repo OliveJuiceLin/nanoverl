@@ -39,9 +39,7 @@ class HFRolloutEngine(RolloutEngine):
         torch, _, _, _ = self._dependencies()
         prompt_values = batch.non_tensor.get("prompt")
         if prompt_values is None:
-            prompt_values = batch.non_tensor.get("prompt_text")
-        if prompt_values is None:
-            raise ValueError("Rollout requires prompt_text or prompt in batch.non_tensor.")
+            raise ValueError("Batch is missing 'prompt' field in non-tensor data, which is required for HFRolloutEngine.")
 
         prompt_token_ids: List[List[int]] = []
         for prompt_value in prompt_values:

@@ -54,7 +54,6 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
     train_loader = StatefulDataLoader(
         train_dataset,
         batch_size=train_batch_size,
-        prompt_key=config.data.prompt_key,
         shuffle=config.data.shuffle,
         seed=config.data.seed,
         drop_last=True,
@@ -66,7 +65,6 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
         val_loader = StatefulDataLoader(
             val_dataset,
             batch_size=val_batch_size,
-            prompt_key=config.data.prompt_key,
             shuffle=False,
             seed=config.data.seed,
             drop_last=False,
