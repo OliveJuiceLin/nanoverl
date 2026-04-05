@@ -1,6 +1,6 @@
 # Nanoverl Architecture
 
-`nanoverl` now has a complete local `Phase 1` path, the intended `Phase 2` usability layer, and the first `Phase 3` backend expansion: the debug scaffold remains intact, the single-process Hugging Face PPO path stays the readable baseline, and a first single-node FSDP training path now runs through the same trainer loop, validation path, logging path, and checkpoint flow.
+`nanoverl` now has a complete local `Phase 1` path, the intended `Phase 2` usability layer, and multiple `Phase 3` backend expansions: the debug scaffold remains intact, the single-process Hugging Face PPO path stays the readable baseline, a first single-node FSDP training path runs through the same trainer loop, and a thin synchronous `vllm` rollout backend now plugs into that loop without widening the trainer abstraction.
 
 ```mermaid
 flowchart LR
@@ -34,6 +34,8 @@ flowchart LR
   - Deterministic rollout backend for smoke tests and algorithm debugging.
 - `nanoverl.rollout.HFRolloutEngine`
   - Local decoder-only rollout using `transformers.generate()` with the same trainer contract as the debug backend.
+- `nanoverl.rollout.VLLMRolloutEngine`
+  - Local decoder-only rollout using `vllm.LLM.generate()` and `LLM.update_weights()` while preserving the same batch contract as the debug and HF rollout engines.
 - `nanoverl.workers.Debug*Worker`
   - Explicit policy, reference, and value worker boundaries.
 - `nanoverl.workers.HF*Worker`
@@ -46,13 +48,15 @@ flowchart LR
 ## Current Contracts
 
 - Both rollout backends now populate the same RL fields:
+- All rollout backends now populate the same RL fields:
   - `prompts`
   - `responses`
   - `input_ids`
   - `attention_mask`
   - `response_mask`
-  - `rollout_log_probs`
   - `response_text`
+- `rollout_log_probs` is now debug-backend-only compatibility data.
+  - Real HF and vLLM rollouts do not compute it because the trainer already recomputes `old_log_probs` from the policy worker.
 - The trainer still owns the PPO ordering:
   - rollout
   - reward
@@ -92,9 +96,13 @@ flowchart LR
 ## Intentional Gaps
 
 - The local HF backend is intentionally single-process and decoder-only first.
-- FSDP is still scaffolded as an explicit backend entry point, but not yet implemented.
+- The current `vllm` rollout path is intentionally synchronous and local:
+  - no async server mode
+  - no Ray rollout workers
+  - no multi-turn/tool rollout
+  - tensor-parallel rollout is still limited to `1` in this thin design
 - Ray integration is still intentionally thin.
-- vLLM, SGLang, LoRA, reward-model serving, and multi-turn/tool rollout are still deferred.
+- SGLang, LoRA, reward-model serving, and multi-turn/tool rollout are still deferred.
 
 ## Phase 3 Progress
 
@@ -106,5 +114,6 @@ The current repo now has the first serious Phase 3 backend slice:
 - lightweight experiment previews exist without overwhelming metric noise
 - `nanoverl.cli.train_rl` is now the canonical training launcher for debug, HF-local, and FSDP presets
 - the first FSDP path uses rank-aware dataloading, rank-0 logging/checkpointing, and shared validation summaries
+- the first `vllm` rollout path keeps validation, checkpoint/resume, and rollout-policy sync on the same trainer path as HF rollout
 
-The next serious step should stay within `Phase 3`, but move from the training backend to research-coverage expansion.
+The next serious step should stay within `Phase 3`, but move from the first thin `vllm` rollout slice to either broader rollout backend coverage or memory-efficiency features that matter for real experiments.

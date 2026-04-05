@@ -6,33 +6,33 @@ from nanoverl.workers.debug import DebugPolicyWorker, DebugReferenceWorker, Debu
 from nanoverl.workers.hf import HFPolicyWorker, HFReferenceWorker, HFValueWorker
 
 
-def create_policy_worker(backend: str, model_config, config) -> PolicyWorker:
+def create_policy_worker(backend: str, model_config, actor_config) -> PolicyWorker:
     if backend == "debug":
-        return DebugPolicyWorker(config)
+        return DebugPolicyWorker(actor_config)
     if backend == "hf":
-        return HFPolicyWorker(model_config, config)
+        return HFPolicyWorker(model_config, actor_config)
     if backend == "fsdp":
-        return FSDPPolicyWorker(model_config, config)
+        return FSDPPolicyWorker(model_config, actor_config)
     raise ValueError("Unknown policy backend: %s" % backend)
 
 
-def create_reference_worker(backend: str, model_config, config) -> ReferenceWorker:
+def create_reference_worker(backend: str, model_config, ref_config) -> ReferenceWorker:
     if backend == "debug":
-        return DebugReferenceWorker(config)
+        return DebugReferenceWorker(ref_config)
     if backend == "hf":
-        return HFReferenceWorker(model_config, config)
+        return HFReferenceWorker(model_config, ref_config)
     if backend == "fsdp":
-        return FSDPReferenceWorker(model_config, config)
+        return FSDPReferenceWorker(model_config, ref_config)
     raise ValueError("Unknown reference backend: %s" % backend)
 
 
-def create_value_worker(backend: str, model_config, config) -> ValueWorker:
+def create_value_worker(backend: str, model_config, critic_config) -> ValueWorker:
     if backend == "debug":
-        return DebugValueWorker(config)
+        return DebugValueWorker(critic_config)
     if backend == "hf":
-        return HFValueWorker(model_config, config)
+        return HFValueWorker(model_config, critic_config)
     if backend == "fsdp":
-        return FSDPValueWorker(model_config, config)
+        return FSDPValueWorker(model_config, critic_config)
     raise ValueError("Unknown value backend: %s" % backend)
 
 

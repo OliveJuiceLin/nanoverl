@@ -1,0 +1,86 @@
+{
+  "data": {
+    "train_path": "examples/data/debug_prompts.jsonl",
+    "val_path": "examples/data/debug_prompts.jsonl",
+    "train_batch_size": 1,
+    "val_batch_size": 1,
+    "shuffle": false,
+    "seed": 7,
+    "max_prompt_length": 256,
+    "max_response_length": 64
+  },
+  "model": {
+    "path": "gpt2",
+    "tokenizer_path": "gpt2",
+    "dtype": "float16"
+  },
+  "algorithm": {
+    "name": "ppo",
+    "advantage_estimator": "gae",
+    "gamma": 1.0,
+    "lam": 1.0
+  },
+  "actor": {
+    "backend": "hf",
+    "device": "cuda:0",
+    "ppo_mini_batch_size": 1,
+    "ppo_epochs": 1,
+    "micro_batch_size": 1,
+    "clip_ratio": 0.2,
+    "lr": 1e-5
+  },
+  "critic": {
+    "backend": "hf",
+    "device": "cuda:0",
+    "enable": true,
+    "ppo_mini_batch_size": 1,
+    "ppo_epochs": 1,
+    "micro_batch_size": 1,
+    "cliprange_value": 0.5,
+    "lr": 1e-5
+  },
+  "reference": {
+    "backend": "hf",
+    "device": "cuda:0",
+    "enable": true
+  },
+  "rollout": {
+    "backend": "vllm",
+    "device": "cuda:0",
+    "response_length": 64,
+    "gpu_memory_utilization": 0.5,
+    "tensor_model_parallel_size": 1,
+    "enforce_eager": false,
+    "engine_kwargs": {
+      "max_model_len": 512
+    },
+    "train": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "do_sample": true,
+      "n": 1
+    },
+    "validation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "do_sample": false,
+      "n": 1
+    }
+  },
+  "reward": {
+    "type": "python",
+    "reward_key": "data_source"
+  },
+  "trainer": {
+    "total_epochs": 1,
+    "validate_before_train": true,
+    "test_freq": 1,
+    "save_freq": 1,
+    "project_name": "nanoverl",
+    "experiment_name": "hf-vllm-local-ppo",
+    "default_local_dir": "checkpoints/hf_vllm_local",
+    "loggers": ["console"]
+  }
+}

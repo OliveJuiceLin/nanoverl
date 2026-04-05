@@ -8,7 +8,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
-from nanoverl.backends.hf import clone_model_state, get_default_device, require_hf_dependencies
+from nanoverl.backends.hf import clone_model_state, get_default_device, load_tokenizer, require_hf_dependencies
 from nanoverl.distributed import TorchDistributedRuntime
 from nanoverl.workers.base import PolicyWorker, ReferenceWorker, ValueWorker
 from nanoverl.workers.hf import HFPolicyWorker, HFReferenceWorker, HFValueWorker
@@ -61,6 +61,7 @@ class FSDPWorkerMixin:
         self.model_config = model_config
         self.runtime = TorchDistributedRuntime.from_environment()
         self.device = self._resolve_device() # 根据 local_rank 绑定显卡
+        self.tokenizer = load_tokenizer(model_config)
         self._maybe_initialize_process_group() # 初始化分布式环境（如果启用的话）
 
     def _resolve_device(self):
@@ -171,7 +172,7 @@ class FSDPPolicyWorker(FSDPWorkerMixin, HFPolicyWorker):
     def __init__(self, model_config, config):
         FSDPWorkerMixin.__init__(self, model_config)
         torch, _, _, _ = require_hf_dependencies()
-        self.config = config
+        self.actor_config = config
         from nanoverl.backends.hf import load_causal_lm
 
         self.model = self._wrap_train_module(load_causal_lm(model_config))
@@ -207,7 +208,7 @@ class FSDPValueWorker(FSDPWorkerMixin, HFValueWorker):
         from nanoverl.backends.hf import load_backbone_model
         from nanoverl.workers.hf import _infer_hidden_size
 
-        self.config = config
+        self.value_config = config
         backbone = load_backbone_model(model_config, path=model_config.critic_path)
         value_head = torch.nn.Linear(_infer_hidden_size(backbone.config), 1)
         self.backbone = self._wrap_train_module(backbone)

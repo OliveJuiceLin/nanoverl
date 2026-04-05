@@ -2,7 +2,6 @@
   "data": {
     "train_path": "examples/data/debug_prompts.jsonl",
     "val_path": "examples/data/debug_prompts.jsonl",
-    "prompt_key": "prompt",
     "train_batch_size": 2,
     "val_batch_size": 2,
     "shuffle": false,
@@ -26,6 +25,7 @@
   },
   "actor": {
     "backend": "hf",
+    "device": "cuda:0",
     "ppo_mini_batch_size": 2,
     "ppo_epochs": 1,
     "micro_batch_size": 1,
@@ -37,6 +37,7 @@
   },
   "critic": {
     "backend": "hf",
+    "device": "cuda:0",
     "enable": true,
     "ppo_mini_batch_size": 2,
     "ppo_epochs": 1,
@@ -48,10 +49,12 @@
   },
   "reference": {
     "backend": "hf",
+    "device": "cuda:0",
     "enable": true
   },
   "rollout": {
     "backend": "hf",
+    "device": "cuda:0",
     "response_length": 64,
     "train": {
       "temperature": 1.0,

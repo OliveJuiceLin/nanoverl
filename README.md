@@ -175,7 +175,7 @@ The repository now includes the first implementation pass of the planned archite
 - `nanoverl.checkpoint.CheckpointManager`
   - local save/resume of trainer and worker state
 
-This is intentionally a clean, readable RL core. The debug and local HF paths are runnable today, and the first single-node FSDP training path now exists as the Phase 3 backend expansion.
+This is intentionally a clean, readable RL core. The debug and local HF paths are runnable today, the first single-node FSDP training path exists, and a thin synchronous `vllm` rollout backend can now be paired with the existing HF or FSDP training workers without changing the trainer loop.
 
 ## Quickstart
 
@@ -197,6 +197,21 @@ Run the first single-node FSDP training preset:
 torchrun --standalone --nproc_per_node=4 -m nanoverl.cli.train_rl --config examples/configs/fsdp_single_node_ppo.json
 ```
 
+Run the local HF actor plus vLLM rollout preset:
+
+```bash
+source /opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh
+conda activate vllm
+python3 -m nanoverl.cli.train_rl --config examples/configs/hf_vllm_local_ppo.json
+```
+
+Run the GSM8K GRPO example with explicit local device placement:
+
+```bash
+python3 examples/data_preprocess/gsm8k.py --local_save_dir examples/GSM8K/processed
+python3 -m nanoverl.cli.train_rl --config examples/configs/Qwen2.5-0.8B-GSM8K-GRPO.json
+```
+
 The packaged CLI aliases are:
 
 ```bash
@@ -216,4 +231,52 @@ The repository is implemented to:
 
 - run the debug path with only the Python standard library
 - keep `torch`/`ray` as explicit optional dependencies in `pyproject.toml`
-- expose a real local HF path and a first single-node FSDP path before adding heavier runtime layers such as Ray
+- expose a real local HF path, a first single-node FSDP path, and a thin synchronous `vllm` rollout path before adding heavier runtime layers such as Ray
+
+The current `vllm` rollout slice is intentionally small:
+
+- synchronous only
+- same rollout contract as the real HF engine
+- no async server mode
+- no Ray rollout workers
+- no multi-turn / tool rollout
+- rollout tensor parallel size currently stays at `1` in this thin local design
+
+## Data And Device Notes
+
+The built-in loader currently expects `.json` or `.jsonl` rows. The most useful fields are:
+
+- `prompt`
+- `expected_response`
+- `data_source`
+- `reward_model`
+- `extra_info`
+
+`prompt` can be either:
+
+- a plain string, or
+- a chat-style message list when the tokenizer provides a chat template
+
+Real HF and vLLM rollout engines now return:
+
+- `prompts`
+- `responses`
+- `input_ids`
+- `attention_mask`
+- `response_mask`
+- `response_text`
+
+They do not compute `rollout_log_probs`; the trainer recomputes `old_log_probs` through the policy worker.
+
+For local HF execution, you can now place components explicitly:
+
+```json
+{
+  "actor": {"backend": "hf", "device": "cuda:0"},
+  "reference": {"backend": "hf", "device": "cuda:0"},
+  "critic": {"backend": "hf", "device": "cuda:0"},
+  "rollout": {"backend": "hf", "device": "cuda:1"}
+}
+```
+
+For `fsdp`, actor/reference/critic placement is still rank-owned by the distributed runtime, so only local rollout device placement is relevant there.

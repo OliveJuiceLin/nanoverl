@@ -67,18 +67,18 @@ class RewardManager:
         # This method became more important in Phase 2 because reward plugins now
         # return both scalar scores and structured extras that should stay visible
         # to validation and artifact dumps without adding more reward-manager layers.
-        prompt_texts = batch.non_tensor.get("prompt_text") or batch.non_tensor.get("prompt")
+        prompt_values = batch.non_tensor.get("prompt") # 纯文本或者是列表["role": "user", "content": "xxx"] 这种结构的字符串化形式
         response_texts = batch.non_tensor.get("response_text")
         response_mask = batch.batch.get("response_mask")
-        if prompt_texts is None or response_texts is None or response_mask is None:
-            raise ValueError("RewardManager requires prompt_text, response_text, and response_mask.")
+        if prompt_values is None or response_texts is None or response_mask is None:
+            raise ValueError("RewardManager requires prompt_values, response_text, and response_mask.")
 
         token_level_scores: List[List[float]] = []
         extras: Dict[str, List[Any]] = {}
         for index in range(len(batch)):
             row = batch.row(index)
             score, extra_payload = _parse_reward_output(
-                self.reward_fn(str(prompt_texts[index]), str(response_texts[index]), row)
+                self.reward_fn(prompt_values[index], response_texts[index], row)
             )
             mask_row = row["response_mask"]
             rewards = [0.0 for _ in mask_row]

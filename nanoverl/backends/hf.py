@@ -51,6 +51,16 @@ def get_default_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def resolve_device(device_name: Optional[str] = None):
+    # This helper is new because the earlier local backend assumed one default
+    # device for every HF component. Once actor, reference, critic, and rollout
+    # may live on different local devices, device resolution needs one shared path.
+    torch, _, _, _ = require_hf_dependencies()
+    if not device_name:
+        return get_default_device()
+    return torch.device(device_name)
+
+
 def load_tokenizer(model_config):
     _, _, _, auto_tokenizer = require_hf_dependencies()
     tokenizer_path = model_config.tokenizer_path or model_config.path
@@ -131,8 +141,39 @@ def pack_prompt_response_tokens(
 
 
 def encode_text(tokenizer, text: str) -> List[int]:
-    encoded = tokenizer(text, add_special_tokens=False)
-    return list(encoded["input_ids"])
+    # encoded = tokenizer(text, add_special_tokens=False)
+    # return list(encoded["input_ids"])
+    # 更简洁的实现：
+    return tokenizer.encode(text, add_special_tokens=False)
+
+
+def render_prompt_text(tokenizer, prompt_value: Any) -> str:
+    # 究竟是使用 template 还是纯字符串取决于数据本身是 str 还是一个符合模板的结构
+    # 换句话说，在数据处理阶段就决定好了模型的输入格式。
+    if isinstance(prompt_value, str):
+        return prompt_value
+    # if tokenizer.chat_template is None:
+    #     return str(prompt_value)
+    if isinstance(prompt_value, Mapping):
+        prompt_value = [dict(prompt_value)]
+    if isinstance(prompt_value, (list, tuple)):
+        return str(tokenizer.apply_chat_template(prompt_value, tokenize=False, add_generation_prompt=True))
+    return str(prompt_value)
+
+
+def trim_generated_response(tokenizer, response_token_ids: Sequence[int]) -> List[int]:
+    # This helper is new because the earlier rollout path treated everything
+    # after the prompt as valid response tokens. Real generation needs one place
+    # to stop at EOS and ignore post-generation padding.
+    trimmed = list(response_token_ids)
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    if eos_token_id is not None and eos_token_id in trimmed:
+        trimmed = trimmed[: trimmed.index(eos_token_id) + 1]
+    if pad_token_id is not None and pad_token_id != eos_token_id:
+        while trimmed and trimmed[-1] == pad_token_id:
+            trimmed.pop()
+    return trimmed
 
 
 def pad_rows(rows: Sequence[Sequence[Any]], pad_value: Any, padding_side: str = "right") -> List[List[Any]]:
@@ -190,8 +231,12 @@ def build_training_tensors(batch, device):
 
 
 def extract_response_stats(
-    logits, input_ids, prompt_token_counts: Sequence[int], response_token_counts: Sequence[int]
-    ) -> (torch.Tensor, torch.Tensor):
+    logits,
+    input_ids,
+    prompt_token_counts: Sequence[int],
+    response_token_counts: Sequence[int],
+    compute_entropy: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Args:
         - logits: 完整一句话的logits，shape为 (batch_size, sequence_length, vocab_size)
@@ -203,16 +248,21 @@ def extract_response_stats(
         - response_entropy: 每个样本中response部分的token熵值，shape为 (batch_size, max_response_length)
     """
     torch, _, _, _ = require_hf_dependencies()
-    shifted_log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1) # 除了最后一个token之外的所有token的logits计算log_probs。shape为 (batch_size, sequence_length - 1, vocab_size)
-    shifted_probs = torch.exp(shifted_log_probs) # 得到概率分布
-    token_entropy = -(shifted_probs * shifted_log_probs).sum(dim=-1) # shape为 (batch_size, sequence_length - 1)，每个token的熵值
-    target_ids = input_ids[:, 1:] # 目标token是输入的token向右shift一个位置，shape为 (batch_size, sequence_length - 1)
-    target_log_probs = torch.gather(shifted_log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1) # 从shifted_log_probs中提取出目标token对应的log_prob，shape为 (batch_size, sequence_length - 1)
-
+    shifted_logits = logits[:, :-1, :]
+    target_ids = input_ids[:, 1:]
+    token_log_normalizers = torch.logsumexp(shifted_logits, dim=-1) # shape为 (batch_size, sequence_length - 1)
+    selected_target_logits = torch.gather(shifted_logits, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+    target_log_probs = selected_target_logits - token_log_normalizers
+    # 取出对应response部分的log_prob，shape为 (batch_size, max_response_length)，其中max_response_length是response_token_counts中的最大值
     batch_size = input_ids.shape[0]
     max_response_length = max(response_token_counts, default=0)
-    response_log_probs = target_log_probs.new_zeros((batch_size, max_response_length))
-    response_entropy = token_entropy.new_zeros((batch_size, max_response_length))
+    response_log_probs = target_log_probs.new_zeros((batch_size, max_response_length)) # 继承数据类型和设备
+    response_entropy = None
+    token_entropy = None
+    if compute_entropy:
+        shifted_probs = torch.softmax(shifted_logits, dim=-1)
+        token_entropy = token_log_normalizers - (shifted_probs * shifted_logits).sum(dim=-1)
+        response_entropy = token_log_normalizers.new_zeros((batch_size, max_response_length))
 
     for row_index, (prompt_token_count, response_token_count) in enumerate(
         zip(prompt_token_counts, response_token_counts)
@@ -222,7 +272,8 @@ def extract_response_stats(
         response_start = max(prompt_token_count - 1, 0) # 指向 prompt 最后
         response_stop = response_start + response_token_count
         response_log_probs[row_index, :response_token_count] = target_log_probs[row_index, response_start:response_stop]
-        response_entropy[row_index, :response_token_count] = token_entropy[row_index, response_start:response_stop]
+        if response_entropy is not None and token_entropy is not None:
+            response_entropy[row_index, :response_token_count] = token_entropy[row_index, response_start:response_stop]
     return response_log_probs, response_entropy
 
 
@@ -242,6 +293,13 @@ def count_valid_tokens(response_masks: Sequence[Sequence[int]]) -> int:
 
 
 def get_loss_weight(batch, loss_agg_mode: str) -> float:
+    """
+    Function:
+        - 根据loss_agg_mode的不同，计算并返回一个用于加权损失
+    Ruturn:
+        - 如果loss_agg_mode是"token-mean"，则返回batch中所有response_mask中有效token的总数（即所有response_mask中值为1的元素的数量）。这个值可以用来对损失进行加权，使得损失的平均值是每个有效token的平均损失。
+        - 如果loss_agg_mode不是"token-mean"，则返回batch的长度（即样本数量）。
+    """
     if loss_agg_mode == "token-mean":
         return float(count_valid_tokens(batch.batch["response_mask"]))
     return float(len(batch))
