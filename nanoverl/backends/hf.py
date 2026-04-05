@@ -129,11 +129,11 @@ def pack_prompt_response_tokens(
     max_prompt_length: int,
     max_response_length: int,
 ) -> Dict[str, List[int]]:
-    prompt_token_ids = truncate_prompt(ensure_prompt_tokens(prompt_token_ids, tokenizer), max_prompt_length)
-    response_token_ids = truncate_response(response_token_ids, max_response_length)
+    prompt_ids = truncate_prompt(ensure_prompt_tokens(prompt_token_ids, tokenizer), max_prompt_length)
+    response_ids = truncate_response(response_token_ids, max_response_length)
     return {
-        "prompt_token_ids": prompt_token_ids,
-        "response_token_ids": response_token_ids,
+        "prompts": prompt_ids,
+        "responses": response_ids,
         "input_ids": prompt_ids + response_ids,
         "attention_mask": [1] * (len(prompt_ids) + len(response_ids)),
         "response_mask": [1] * len(response_ids),
@@ -229,8 +229,12 @@ def build_training_tensors(batch, device):
 
 
 def extract_response_stats(
-    logits, input_ids, prompt_token_counts: Sequence[int], response_token_counts: Sequence[int]
-    ) -> (torch.Tensor, torch.Tensor):
+    logits,
+    input_ids,
+    prompt_token_counts: Sequence[int],
+    response_token_counts: Sequence[int],
+    compute_entropy: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Args:
         - logits: 完整一句话的logits，shape为 (batch_size, sequence_length, vocab_size)
@@ -242,16 +246,21 @@ def extract_response_stats(
         - response_entropy: 每个样本中response部分的token熵值，shape为 (batch_size, max_response_length)
     """
     torch, _, _, _ = require_hf_dependencies()
-    shifted_log_probs = torch.log_softmax(logits[:, :-1, :], dim=-1) # 除了最后一个token之外的所有token的logits计算log_probs。shape为 (batch_size, sequence_length - 1, vocab_size)
-    shifted_probs = torch.exp(shifted_log_probs) # 得到概率分布
-    token_entropy = -(shifted_probs * shifted_log_probs).sum(dim=-1) # shape为 (batch_size, sequence_length - 1)，每个token的熵值
-    target_ids = input_ids[:, 1:] # 目标token是输入的token向右shift一个位置，shape为 (batch_size, sequence_length - 1)
-    target_log_probs = torch.gather(shifted_log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1) # 从shifted_log_probs中提取出目标token对应的log_prob，shape为 (batch_size, sequence_length - 1)
+    shifted_logits = logits[:, :-1, :]
+    target_ids = input_ids[:, 1:]
+    token_log_normalizers = torch.logsumexp(shifted_logits, dim=-1) # shape为 (batch_size, sequence_length - 1)
+    selected_target_logits = torch.gather(shifted_logits, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+    target_log_probs = selected_target_logits - token_log_normalizers
 
     batch_size = input_ids.shape[0]
     max_response_length = max(response_token_counts, default=0)
     response_log_probs = target_log_probs.new_zeros((batch_size, max_response_length))
-    response_entropy = token_entropy.new_zeros((batch_size, max_response_length))
+    response_entropy = None
+    token_entropy = None
+    if compute_entropy:
+        shifted_probs = torch.softmax(shifted_logits, dim=-1)
+        token_entropy = token_log_normalizers - (shifted_probs * shifted_logits).sum(dim=-1)
+        response_entropy = token_log_normalizers.new_zeros((batch_size, max_response_length))
 
     for row_index, (prompt_token_count, response_token_count) in enumerate(
         zip(prompt_token_counts, response_token_counts)
@@ -261,7 +270,8 @@ def extract_response_stats(
         response_start = max(prompt_token_count - 1, 0) # 指向 prompt 最后
         response_stop = response_start + response_token_count
         response_log_probs[row_index, :response_token_count] = target_log_probs[row_index, response_start:response_stop]
-        response_entropy[row_index, :response_token_count] = token_entropy[row_index, response_start:response_stop]
+        if response_entropy is not None and token_entropy is not None:
+            response_entropy[row_index, :response_token_count] = token_entropy[row_index, response_start:response_stop]
     return response_log_probs, response_entropy
 
 

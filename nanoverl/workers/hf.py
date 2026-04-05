@@ -16,6 +16,7 @@ from nanoverl.backends.hf import (
     get_response_lengths,
     load_backbone_model,
     load_causal_lm,
+    load_tokenizer,
     require_hf_dependencies,
     resolve_device,
     tensor_to_list_rows,
@@ -130,6 +131,7 @@ class HFWorkerBase:
     def __init__(self, model_config, device_name: Optional[str] = None):
         self.model_config = model_config
         self.device = resolve_device(device_name)
+        self.tokenizer = load_tokenizer(model_config)
 
     def _build_model_inputs(self, batch):
         """
@@ -137,11 +139,17 @@ class HFWorkerBase:
             - 将 batch 中的 input_ids 和 attention_mask 转换为适合模型输入的张量格式。
         """
         torch, _, _, _ = require_hf_dependencies()
-        input_ids = batch_lists_to_tensor(batch.batch["input_ids"], 0, device=self.device, dtype=torch.long, padding_side='right')
+        input_ids = batch_lists_to_tensor(
+            batch.batch["input_ids"],
+            self.tokenizer.pad_token_id,
+            device=self.device,
+            dtype=torch.long,
+            padding_side="right",
+        )
         attention_mask = batch_lists_to_tensor(batch.batch["attention_mask"], 0, device=self.device, dtype=torch.long, padding_side='right')
         return input_ids, attention_mask
 
-    def _compute_response_log_probs_and_entropy(self, model, batch):
+    def _compute_response_log_probs_and_entropy(self, model, batch, compute_entropy: bool = False):
         """
         Function:
             - 计算给定 batch 中响应部分的对数概率和熵值。
@@ -151,12 +159,15 @@ class HFWorkerBase:
         """
         input_ids, attention_mask = self._build_model_inputs(batch)
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        return extract_response_stats(
+        response_log_probs, response_entropy = extract_response_stats(
             logits=outputs.logits,
             input_ids=input_ids,
             prompt_token_counts=get_prompt_lengths(batch),
             response_token_counts=get_response_lengths(batch),
+            compute_entropy=compute_entropy,
         )
+        del outputs
+        return response_log_probs, response_entropy
 
     def _no_grad(self):
         torch, _, _, _ = require_hf_dependencies()
@@ -190,7 +201,7 @@ class HFReferenceWorker(HFWorkerBase, ReferenceWorker):
 
     def compute_log_probs(self, batch) -> LogProbResult:
         with self._no_grad():
-            response_log_probs, _ = self._compute_response_log_probs_and_entropy(self.model, batch)
+            response_log_probs, _ = self._compute_response_log_probs_and_entropy(self.model, batch, compute_entropy=False)
         response_lengths = get_response_lengths(batch)
         return LogProbResult(
             log_probs=tensor_to_list_rows(response_log_probs, response_lengths),
@@ -234,11 +245,10 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
         """
         self.model.eval()
         with self._no_grad():
-            response_log_probs, response_entropy = self._compute_response_log_probs_and_entropy(self.model, batch)
+            response_log_probs, _ = self._compute_response_log_probs_and_entropy(self.model, batch, compute_entropy=False)
         response_lengths = get_response_lengths(batch)
         return LogProbResult(
             log_probs=tensor_to_list_rows(response_log_probs, response_lengths),
-            entropy=tensor_to_list_rows(response_entropy, response_lengths),
             metrics={"policy_update_steps": float(self.update_steps)},
         )
 
@@ -262,7 +272,9 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                 self.optimizer.zero_grad() # 在对一个 mini-batch 的所有 micro-batch 进行反向传播之前，先将优化器的梯度缓存清零，以避免梯度累积到之前的 mini-batch 中。
                 for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据 PPO 的损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
                     current_log_probs, current_entropy = self._compute_response_log_probs_and_entropy(
-                        self.model, microbatch
+                        self.model,
+                        microbatch,
+                        compute_entropy=self.actor_config.entropy_coeff != 0.0,
                     )
                     training_tensors = build_training_tensors(microbatch, self.device)
                     policy_loss, step_metrics = _compute_policy_loss(
@@ -276,9 +288,13 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                         clip_ratio_c=self.actor_config.clip_ratio_c,
                         loss_agg_mode=self.actor_config.loss_agg_mode,
                     )
-                    entropy_bonus = _masked_mean(current_entropy, training_tensors["response_mask"])
-                    total_loss = policy_loss - (self.actor_config.entropy_coeff * entropy_bonus)
-                    step_metrics["policy_entropy"] = float(entropy_bonus.detach().cpu())
+                    if current_entropy is not None:
+                        entropy_bonus = _masked_mean(current_entropy, training_tensors["response_mask"])
+                        total_loss = policy_loss - (self.actor_config.entropy_coeff * entropy_bonus)
+                        step_metrics["policy_entropy"] = float(entropy_bonus.detach().cpu())
+                    else:
+                        total_loss = policy_loss
+                        step_metrics["policy_entropy"] = 0.0
 
                     if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
                         kl_penalty = _compute_kl_penalty(

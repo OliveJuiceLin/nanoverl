@@ -459,7 +459,6 @@ class RLTrainer:
         t0 = time.time()
         old_log_probs = self.policy_worker.compute_log_probs(rollout_batch)
         rollout_batch.batch["old_log_probs"] = old_log_probs.log_probs
-        rollout_batch.batch["entropy"] = old_log_probs.entropy
         metrics.update({"actor/%s" % key: value for key, value in old_log_probs.metrics.items()})
         timing["policy_eval"] = time.time() - t0
         # 3. 计算参考模型的 log 概率（如果 reference_worker 存在）-> 奖励 shaping 时会被用做 KL 惩罚作为 token-level 的奖励调整，同时也会被记录到 metrics 中以供分析。

@@ -53,7 +53,7 @@ class HFRolloutEngine(RolloutEngine):
                 max_prompt_length=self.data_config.max_prompt_length,
                 max_response_length=self.rollout_config.response_length,
             )
-            prompt_token_ids.append(packed_prompt["prompt_token_ids"])
+            prompt_token_ids.append(packed_prompt["prompts"])
 
         prompt_input_ids = batch_lists_to_tensor(
             prompt_token_ids,
@@ -100,8 +100,8 @@ class HFRolloutEngine(RolloutEngine):
 
         rollout_batch = RLBatch(
             batch={
-                "prompts": [row["prompt_token_ids"] for row in packed_rows],
-                "responses": [row["response_token_ids"] for row in packed_rows],
+                "prompts": [row["prompts"] for row in packed_rows],
+                "responses": [row["responses"] for row in packed_rows],
                 "input_ids": [row["input_ids"] for row in packed_rows],
                 "attention_mask": [row["attention_mask"] for row in packed_rows],
                 "response_mask": [row["response_mask"] for row in packed_rows],
