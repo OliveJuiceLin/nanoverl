@@ -48,8 +48,8 @@ class StatefulDataLoaderTest(unittest.TestCase):
             rank0_batch = rank0_loader.next_batch()
             rank1_batch = rank1_loader.next_batch()
 
-            self.assertEqual(rank0_batch.non_tensor["prompt_text"], ["a"])
-            self.assertEqual(rank1_batch.non_tensor["prompt_text"], ["b"])
+            self.assertEqual(rank0_batch.non_tensor["prompt"], ["a"])
+            self.assertEqual(rank1_batch.non_tensor["prompt"], ["b"])
             self.assertEqual(len(rank0_loader), 2)
             self.assertEqual(len(rank1_loader), 2)
 

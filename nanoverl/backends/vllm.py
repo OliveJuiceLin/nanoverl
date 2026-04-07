@@ -36,7 +36,7 @@ def build_vllm_sampling_params(sampling: SamplingParams, max_response_length: in
     _, _, vllm_sampling_params = require_vllm_dependencies()
     top_k = sampling.top_k if sampling.top_k and sampling.top_k > 0 else -1
     return vllm_sampling_params(
-        n=1,
+        n=1,  # The trainer already repeats prompts before rollout, so each vLLM request only needs one completion.
         temperature=sampling.temperature,
         top_p=sampling.top_p,
         top_k=top_k,

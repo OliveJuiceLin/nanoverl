@@ -62,9 +62,7 @@ class VLLMRolloutEngine(RolloutEngine):
         # while the trainer, reward path, and worker contracts stay unchanged.
         prompt_values = batch.non_tensor.get("prompt")
         if prompt_values is None:
-            prompt_values = batch.non_tensor.get("prompt_text")
-        if prompt_values is None:
-            raise ValueError("Rollout requires prompt_text or prompt in batch.non_tensor.")
+            raise ValueError("Batch is missing 'prompt' field in non-tensor data, which is required for VLLMRolloutEngine.")
 
         prompt_token_rows: List[List[int]] = []
         prompt_inputs: List[Dict[str, List[int]]] = []
@@ -72,7 +70,7 @@ class VLLMRolloutEngine(RolloutEngine):
             prompt_text = render_prompt_text(self.tokenizer, prompt_value)
             packed_prompt = pack_prompt_response_tokens(
                 tokenizer=self.tokenizer,
-                prompt_token_ids=encode_text(self.tokenizer, str(prompt_text)),
+                prompt_token_ids=encode_text(self.tokenizer, prompt_text),
                 response_token_ids=[],
                 max_prompt_length=self.data_config.max_prompt_length,
                 max_response_length=self.rollout_config.response_length,

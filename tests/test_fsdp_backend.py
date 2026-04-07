@@ -97,7 +97,7 @@ class FSDPBackendTest(unittest.TestCase):
                 "attention_mask": [row["attention_mask"] for row in packed_rows],
                 "response_mask": [row["response_mask"] for row in packed_rows],
             },
-            non_tensor={"prompt_text": list(prompts), "response_text": list(responses)},
+            non_tensor={"prompt": list(prompts), "response_text": list(responses)},
         )
 
     def _make_config(self, model_dir: Path, checkpoint_dir: Path, dataset_path: Path) -> TrainerConfig:
@@ -191,9 +191,9 @@ class FSDPBackendTest(unittest.TestCase):
             self.assertEqual(len(values.values[1]), len(batch.batch["responses"][1]))
 
             rollout = HFRolloutEngine(config.model, config.data, config.rollout)
-            before = rollout.generate(RLBatch(non_tensor={"prompt_text": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
+            before = rollout.generate(RLBatch(non_tensor={"prompt": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
             rollout.sync_policy(policy_worker.state_dict())
-            after = rollout.generate(RLBatch(non_tensor={"prompt_text": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
+            after = rollout.generate(RLBatch(non_tensor={"prompt": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
             self.assertEqual(len(before.batch["responses"][0]), len(after.batch["responses"][0]))
             self.assertLess(before.meta["policy_sync_steps"], after.meta["policy_sync_steps"])
 

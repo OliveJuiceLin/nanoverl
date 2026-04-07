@@ -202,7 +202,7 @@ class VLLMBackendTest(unittest.TestCase):
             )
             rollout_engine = VLLMRolloutEngine(config.model, config.data, config.rollout)
             rollout_batch = rollout_engine.generate(
-                RLBatch(non_tensor={"prompt_text": ["say yes"]}),
+                RLBatch(non_tensor={"prompt": ["say yes"]}),
                 SamplingParams(do_sample=False, temperature=0.0, n=1),
             )
 
