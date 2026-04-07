@@ -8,9 +8,9 @@ def extract_final_answer(text: str) -> str | None:
 
 def compute_reward(prompt, response, sample):
     predicted = extract_final_answer(response)
-    target = str(sample.get("expected_response") or sample["reward_model"]["ground_truth"]).strip()
+    target = str( sample["reward_model"]["ground_truth"] or sample.get("expected_response") ).strip()
     if predicted is None:
-        return {"score": 0.0, "format_ok": 0.0}
+        return {"score": 0.0, "format_ok": 0.0, 'predicted_answer':None}
     return {
         "score": 1.0 if predicted == target else 0.0,
         "format_ok": 1.0,

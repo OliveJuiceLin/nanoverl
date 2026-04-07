@@ -245,11 +245,17 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                 - metrics: 一个字典，包含一些指标信息，例如 policy_update_steps，表示当前策略更新的步数。
         """
         self.model.eval()
+        all_log_probs = []
         with self._no_grad():
-            response_log_probs, _ = self._compute_response_log_probs_and_entropy(self.model, batch, compute_entropy=False)
-        response_lengths = get_response_lengths(batch)
+            minibatches = list(self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, shuffle=False))
+            for minibatch in minibatches:
+                response_log_probs, _ = self._compute_response_log_probs_and_entropy(
+                    self.model, minibatch, compute_entropy=False
+                )
+                response_lengths = get_response_lengths(minibatch)
+                all_log_probs.extend(tensor_to_list_rows(response_log_probs, response_lengths))        
         return LogProbResult(
-            log_probs=tensor_to_list_rows(response_log_probs, response_lengths),
+            log_probs=all_log_probs,
             metrics={"policy_update_steps": float(self.update_steps)},
         )
 

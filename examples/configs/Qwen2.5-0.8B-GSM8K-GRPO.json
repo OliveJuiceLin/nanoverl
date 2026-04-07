@@ -7,7 +7,7 @@
     "shuffle": true,
     "seed": 7,
     "max_prompt_length": 512,
-    "max_response_length": 256
+    "max_response_length": 512
   },
   "model": {
     "path": "Qwen/Qwen2.5-0.8B-Instruct",
@@ -44,7 +44,7 @@
   "rollout": {
     "backend": "hf",
     "device": "cuda:1",
-    "response_length": 256,
+    "response_length": 512,
     "train": {
       "temperature": 1.0,
       "top_p": 1.0,
