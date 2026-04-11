@@ -156,6 +156,7 @@ def render_prompt_text(tokenizer, prompt_value: Any) -> str:
     #     return str(prompt_value)
     if isinstance(prompt_value, Mapping):
         prompt_value = [dict(prompt_value)]
+    # TODO: 这里有一个问题，apply_chat_template 会假如一个 system_prompt，有可能和我们的要求冲突
     if isinstance(prompt_value, (list, tuple)):
         return str(tokenizer.apply_chat_template(prompt_value, tokenize=False, add_generation_prompt=True))
     return str(prompt_value)
@@ -166,8 +167,8 @@ def trim_generated_response(tokenizer, response_token_ids: Sequence[int]) -> Lis
     # after the prompt as valid response tokens. Real generation needs one place
     # to stop at EOS and ignore post-generation padding.
     trimmed = list(response_token_ids)
-    eos_token_id = tokenizer.eos_token_id
-    pad_token_id = tokenizer.pad_token_id
+    eos_token_id = tokenizer.eos_token_id # '<|im_end|>'
+    pad_token_id = tokenizer.pad_token_id # '<|endoftext|>'
     if eos_token_id is not None and eos_token_id in trimmed:
         trimmed = trimmed[: trimmed.index(eos_token_id) + 1]
     if pad_token_id is not None and pad_token_id != eos_token_id:

@@ -80,7 +80,7 @@ def _compute_policy_loss(
     
     lower_clipped_loss = (-advantages * clip_ratio_c).minimum(clipped_candidate) # 这个部分是对负优势（即新策略表现更差的情况）进行额外的裁剪，防止策略更新过度惩罚那些表现更差的动作。clip_ratio_c 是一个额外的裁剪参数，用于控制这种情况的损失。
     final_loss = clipped_candidate.where(advantages >= 0.0, lower_clipped_loss) # 如果优势大于等于 0（表现好于平均）：说明这是一个好动作，我们希望新策略尽量提高它的出现概率。此时不需要什么“最大惩罚上限”，直接使用常规的截断损失；如果优势小于 0（表现差于平均）：触发保护机制，如果惩罚过大就会被 lower_clipped_loss 截断，防止梯度被单一极端的负优势样本主导。
-    masked_loss = final_loss * response_mask # TODO: 本身传入的张量shape为 (batch_size, max_response_length)对应 response 部分了，不需要再乘以 response_mask 了，直接 masked_loss = final_loss 就行了，未来可以简化逻辑
+    masked_loss = final_loss * response_mask # TODO: 不需要在这里乘以response_mask，因为在之后的 aggrate 中会处理，未来可以简化逻辑，直接传入 final_loss 和 response_mask 到  _aggregate_loss 中，让它来处理掩码和聚合的逻辑。
     aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode) # 根据 loss_agg_mode 的不同，对损失进行不同方式的聚合，例如按 token 平均、按序列平均等。
 
     valid_token_count = response_mask.sum().clamp_min(1.0)
@@ -261,11 +261,11 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
 
     def update(self, batch) -> UpdateResult:
         torch, _, _, _ = require_hf_dependencies()
-        metric_history: Dict[str, List[float]] = {}
+        metric_history: Dict[str, List[float]] = {} # 这个metric_history字典每次附加上去的是每个 microbatch 的指标值，最后在整个 update 结束后会对这些指标值进行平均
         self.model.train()
 
         for _ in range(self.actor_config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
-            minibatches = self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, self.actor_config.shuffle)
+            minibatches = list(self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, self.actor_config.shuffle))
             for minibatch in minibatches: # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
                 microbatches = list(self._iter_microbatches(minibatch, self.actor_config.micro_batch_size))
                 if not microbatches:
@@ -321,9 +321,9 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
 
                 if self.actor_config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.actor_config.max_grad_norm)
-                self.optimizer.step() # 对一个mini-batch的所有 micro-batch 进行反向传播并累积梯度后，进行一次优化器步骤来更新模型参数。
+                self.optimizer.step() # 对一个mini-batch的所有 micro-batch 进行反向传播并累积梯度后，进行一次优化器步骤来更新模型参数。是显存增加最多的地方，例如 8k->16K
 
-        self.update_steps += 1
+        self.update_steps += 1 # 实际上这里更新了ppo_epochs*len(batch)/ppo_mini_batch_size 次，但我们把它当做一次整体的策略更新。
         self.model.eval()
         averaged_metrics = {name: average_or_zero(values) for name, values in metric_history.items()}
         averaged_metrics["actor_update_steps"] = float(self.update_steps)

@@ -43,7 +43,7 @@
   },
   "rollout": {
     "backend": "hf",
-    "device": "cuda:1",
+    "device": "cuda:3",
     "response_length": 512,
     "train": {
       "temperature": 1.0,

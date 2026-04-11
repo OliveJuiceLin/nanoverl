@@ -455,7 +455,7 @@ class RLTrainer:
         # 2. 计算旧策略的 log 概率 -> 重要性采样
         # 这里 policy_worker 和 rollout 的模型的参数实际上是一样的: 
         t0 = time.time()
-        old_log_probs = self.policy_worker.compute_log_probs(rollout_batch)
+        old_log_probs = self.policy_worker.compute_log_probs(rollout_batch) # 这里会发生显存的增长例如大约3k->8k
         rollout_batch.batch["old_log_probs"] = old_log_probs.log_probs
         metrics.update({"actor/%s" % key: value for key, value in old_log_probs.metrics.items()})
         timing["policy_eval"] = time.time() - t0
