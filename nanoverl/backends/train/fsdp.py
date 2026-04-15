@@ -98,7 +98,7 @@ class FSDPWorkerMixin:
             - 包装后的模型，适合训练使用。
         """
         torch, fully_sharded_data_parallel, _, _, sharding_strategy = _require_fsdp_dependencies()
-        module = module.to(self.device)
+        # module = module.to(self.device) 不要在这里直接搬运到 GPU 上，等 FSDP 包装时再搬运。因为 FSDP 的 sync_module_states 参数会在包装时自动将 CPU 上的权重切片并分发到对应 GPU，这样能避开峰值 OOM。
         if not self.runtime.enabled or self.device.type != "cuda":
             return module
         return fully_sharded_data_parallel(

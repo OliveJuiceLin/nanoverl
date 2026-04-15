@@ -87,6 +87,7 @@ def load_causal_lm(model_config):
         model_config.path,
         dtype=resolve_torch_dtype(model_config.dtype),
         trust_remote_code=model_config.trust_remote_code,
+        attn_implementation=model_config.attn_implementation,
     )
 
 

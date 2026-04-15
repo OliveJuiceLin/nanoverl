@@ -1,4 +1,0 @@
-{"uid": "ex-1", "prompt": "What is two plus two?", "expected_response": "four", "data_source": "math", "reward_model": {"ground_truth": "four"}}
-{"uid": "ex-2", "prompt": "What color is the sky on a clear day?", "expected_response": "blue", "data_source": "qa", "reward_model": {"ground_truth": "blue"}}
-{"uid": "ex-3", "prompt": "Complete the phrase: hello", "expected_response": "world", "data_source": "completion", "reward_model": {"ground_truth": "world"}}
-{"uid": "ex-4", "prompt": "Respond with yes", "expected_response": "yes", "data_source": "qa", "reward_model": {"ground_truth": "yes"}}

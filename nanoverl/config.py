@@ -1,4 +1,6 @@
-"""Typed configuration objects for nanoverl."""
+"""Typed configuration objects for nanoverl.
+目前的实现用户必须配置这里已有的字段，暂时不支持配置文件里没有的字段，如果想增加配置，必须在这里也增加
+"""
 
 from __future__ import annotations
 
@@ -88,6 +90,7 @@ class ModelConfig:
     use_remove_padding: bool = True
     dtype: str = "float32"
     chat_template_path: Optional[str] = None
+    attn_implementation: Optional[str] = None
 
 
 @dataclass
@@ -129,7 +132,7 @@ class ActorConfig:
     update_step_size: float = 0.02
     lr: float = 1e-5
     weight_decay: float = 0.0
-    betas: Tuple[float, float] = (0.9, 0.999)
+    betas: Tuple[float, float] = (0.9, 0.95) # or (0.9, 0.999)?
     eps: float = 1e-8
     max_grad_norm: float = 1.0
     shuffle: bool = True

@@ -1,0 +1,80 @@
+{
+  "data": {
+    "train_path": "examples/GSM8K/processed/train.jsonl",
+    "val_path": "examples/GSM8K/processed/test.jsonl",
+    "train_batch_size": 8,
+    "val_batch_size": 8,
+    "shuffle": true,
+    "seed": 7,
+    "max_prompt_length": 512,
+    "max_response_length": 512
+  },
+  "model": {
+    "path": "Qwen/Qwen2.5-0.8B-Instruct",
+    "tokenizer_path": "Qwen/Qwen2.5-0.8B-Instruct",
+    "dtype": "bfloat16",
+    "attn_implementation": "flash_attention_2"
+  },
+  "algorithm": {
+    "name": "grpo",
+    "advantage_estimator": "grpo",
+    "norm_adv_by_std_in_grpo": true
+  },
+  "actor": {
+    "backend": "hf",
+    "device": "cuda:0",
+    "ppo_mini_batch_size": 8,
+    "ppo_epochs": 1,  
+    "micro_batch_size": 1,
+    "clip_ratio": 0.2,
+    "use_kl_loss": false,
+    "kl_loss_coef": 0.001,
+    "lr": 5e-7,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0
+  },
+  "critic": {
+    "backend": "hf",
+    "enable": false
+  },
+  "reference": {
+    "backend": "hf",
+    "device": "cuda:0",
+    "enable": false
+  },
+  "rollout": {
+    "backend": "hf",
+    "device": "cuda:3",
+    "response_length": 512,
+    "train": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "do_sample": true,
+      "n": 4
+    },
+    "validation": {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "do_sample": false,
+      "n": 1
+    }
+  },
+  "reward": {
+    "type": "python",
+    "function_path": "examples/reward_fn/gsm8k.py",
+    "function_name": "compute_reward"
+  },
+  "trainer": {
+    "total_epochs": 1,
+    "validate_before_train": false,
+    "test_freq": 50,
+    "save_freq": 50,
+    "critic_warmup": 0,
+    "project_name": "nanoverl_gsm8k",
+    "experiment_name": "qwen2_5_0_8b_grpo",
+    "default_local_dir": "checkpoints/qwen2_5_0_8b_grpo",
+    "loggers": ["console"]
+  }
+}

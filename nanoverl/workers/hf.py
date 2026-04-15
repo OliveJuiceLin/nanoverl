@@ -232,6 +232,14 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
             eps=actor_config.eps,
             weight_decay=actor_config.weight_decay,
         )
+        # TODO: Use bnb for 8-bit AdamW if needed
+        # self.optimizer = bnb.optim.AdamW8bit(
+        #     self.model.parameters(),
+        #     lr=actor_config.lr,
+        #     betas=tuple(actor_config.betas),
+        #     eps=actor_config.eps,
+        #     weight_decay=actor_config.weight_decay,
+        # )
         self.update_steps = 0
 
     def compute_log_probs(self, batch) -> LogProbResult:
