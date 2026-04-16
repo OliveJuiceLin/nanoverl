@@ -90,7 +90,7 @@ class ModelConfig:
     use_remove_padding: bool = True
     dtype: str = "float32"
     chat_template_path: Optional[str] = None
-    attn_implementation: Optional[str] = None
+    attn_implementation: str = "eager"
 
 
 @dataclass

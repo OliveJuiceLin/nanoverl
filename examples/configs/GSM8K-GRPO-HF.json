@@ -13,7 +13,7 @@
     "path": "Qwen/Qwen2.5-0.8B-Instruct",
     "tokenizer_path": "Qwen/Qwen2.5-0.8B-Instruct",
     "dtype": "bfloat16",
-    "attn_implementation": "flash_attention_2"
+    "attn_implementation": "sdpa"
   },
   "algorithm": {
     "name": "grpo",

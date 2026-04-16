@@ -13,7 +13,7 @@
       "path": "/data3/whr/wyl/Model_Hub/Qwen2.5-Math-1.5B-Instruct",
       "tokenizer_path": "/data3/whr/wyl/Model_Hub/Qwen2.5-Math-1.5B-Instruct",
       "dtype": "bfloat16",
-      "attn_implementation": "flash_attention_2"
+      "attn_implementation": "sdpa"
     },
     "algorithm": {
       "name": "grpo",
