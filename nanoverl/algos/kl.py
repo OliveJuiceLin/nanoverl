@@ -9,7 +9,23 @@ from typing import List, Sequence, Tuple
 Matrix = Sequence[Sequence[float]]
 
 
+def _is_tensor_like(value) -> bool:
+    return hasattr(value, "detach") and hasattr(value, "shape")
+
+
 def compute_kl_penalty(log_probs: Matrix, ref_log_probs: Matrix, mode: str = "kl") -> List[List[float]]:
+    if _is_tensor_like(log_probs):
+        diff = log_probs - ref_log_probs
+        if mode in {"kl", "k1"}:
+            return diff
+        if mode == "abs":
+            return diff.abs()
+        if mode in {"mse", "k2"}:
+            return 0.5 * (diff ** 2)
+        if mode in {"low_var_kl", "k3"}:
+            return (-diff).exp() + diff - 1.0
+        raise ValueError("Unsupported KL penalty mode: %s" % mode)
+
     penalties: List[List[float]] = []
     for row, ref_row in zip(log_probs, ref_log_probs):
         penalty_row: List[float] = []
@@ -41,6 +57,15 @@ def apply_kl_penalty(
     """
     Function:
     """
+    if _is_tensor_like(token_level_scores):
+        penalties = compute_kl_penalty(old_log_probs, ref_log_probs, mode=mode)
+        rewards = token_level_scores.where(response_mask <= 0, token_level_scores - beta * penalties)
+        valid_penalties = penalties[response_mask > 0]
+        mean_penalty = 0.0
+        if valid_penalties.numel() > 0:
+            mean_penalty = float(valid_penalties.mean().detach().cpu())
+        return rewards, mean_penalty
+
     penalties: List[List[float]] = compute_kl_penalty(old_log_probs, ref_log_probs, mode=mode)
     rewards: List[List[float]] = []
     masked_penalties: List[float] = []

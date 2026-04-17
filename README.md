@@ -1,282 +1,164 @@
 # nanoverl
 
-`nanoverl` is a simplified, research-oriented reimplementation of the RL training core in `verl`.
+## What Is Nanoverl
 
-It is designed for researchers and students who want to **understand, modify, and extend RL algorithms for large language models** without being overwhelmed by the full engineering complexity of the original codebase.
+`nanoverl` is a small, research-oriented RL framework for large language models.
 
-## Why nanoverl?
+It is inspired by `verl`, but it deliberately keeps a much smaller surface area:
 
-The original `verl` is a powerful and production-oriented framework. However, for research and learning purposes, it can be difficult to navigate because it contains:
+- one clear synchronous trainer loop
+- explicit policy / reference / value / rollout boundaries
+- enough engineering for real PPO / GRPO experiments
+- fewer layers that get in the way of reading and modifying the code
 
-- multiple layers of abstraction
-- many engineering paths for compatibility and scalability
-- duplicated or parallel implementations for different backends
-- features not essential to core RL algorithm research
-- code paths for workflows outside the main RL focus
+This repository is not trying to be a feature-complete replacement for `verl`.
+Its goal is to be a clean RL core that is easy to understand, easy to modify, and still usable for real experiments.
 
-`nanoverl` aims to preserve the **core training capability and code quality** of `verl`, while removing parts that are not necessary for:
+## Current Status
 
-- understanding RLHF / RLAIF style training loops
-- studying PPO / GRPO / related policy optimization algorithms
-- modifying actor / critic / reward / rollout interactions
-- running clean and reproducible research experiments on LLM RL training
+The current repository should be understood like this:
 
-In short, `nanoverl` is **not a toy project**.  
-It is a **minimal but real** RL training framework derived from the design principles and core workflow of `verl`.
+- The formal mainline is still a Phase 1 style synchronous RL core.
+- Some Phase 2 usability work is already present, such as GRPO support, validation summaries, and lightweight debug artifacts.
+- There are already a few thin Phase 3 backend slices, especially single-node FSDP and local `vllm` rollout integration.
+- Not every exposed option should be read as a mature production feature. Some parts are intentionally thin and kept as future extension points.
 
-## Project Goal
+Today, the most trustworthy path is still:
 
-The goal of `nanoverl` is:
+- typed config
+- stateful dataset / dataloader
+- synchronous trainer
+- explicit policy / reference / value workers
+- rollout -> reward -> advantage -> update
+- checkpoint / validation / logging on the same main loop
 
-- keep the **core RL training pipeline** intact
-- make the codebase **clear, compact, and readable**
-- make it easier to **modify algorithms**
-- reduce unnecessary framework complexity
-- keep enough engineering quality for real experiments
+## Repo Map
 
-This project is mainly focused on **reinforcement learning for large language models**.
+The repository is organized around the RL training path.
 
-## What nanoverl focuses on
+- `nanoverl/algos`
+  - Core RL math helpers such as PPO losses, KL penalties, and advantage estimators.
+- `nanoverl/backends`
+  - Thin backend-specific utilities for Hugging Face, `vllm`, and training backends such as FSDP.
+- `nanoverl/checkpoint`
+  - Local checkpoint save / load helpers.
+- `nanoverl/config.py`
+  - The typed config tree and config validation logic.
+- `nanoverl/core`
+  - Small shared core data structures, mainly `RLBatch`.
+- `nanoverl/data`
+  - Built-in dataset loading and the checkpointable data loader / sampler.
+- `nanoverl/distributed`
+  - Small runtime helpers for `torch.distributed` and future distributed integrations.
+- `nanoverl/logging`
+  - Metrics helpers and tracker backends.
+- `nanoverl/reward`
+  - Reward function loading and reward result shaping.
+- `nanoverl/rollout`
+  - Rollout engine interfaces and concrete backends such as debug, HF, and `vllm`.
+- `nanoverl/trainer`
+  - The main trainer loop, validation helpers, and debug artifact writers.
+- `nanoverl/workers`
+  - Policy / reference / value worker interfaces and implementations.
+- `examples`
+  - Example configs, reward functions, and local experiment helpers.
+- `tests`
+  - Regression tests for the trainer loop, RL math, batch behavior, and backend slices.
 
-`nanoverl` mainly focuses on the RL part of the stack:
+## How Training Works
 
-- training loop
-- policy optimization algorithm
-- actor / critic interaction
-- reward computation interface
-- rollout / sampling interface
-- batch preparation for RL updates
-- distributed execution path that is necessary for RL training
-- logging, checkpointing, and experiment control
+The current trainer owns the whole RL step explicitly.
 
-These are the parts that should become smaller, cleaner, and easier to understand than in the original `verl`.
+1. Load a batch from the stateful train loader.
+2. Expand prompts for grouped sampling when needed.
+3. Run rollout to produce responses.
+4. Compute reward outputs from prompt + response.
+5. Recompute old policy log-probs.
+6. Compute reference log-probs and value estimates when enabled.
+7. Build token-level rewards and advantages.
+8. Update critic first when the critic is active.
+9. Update actor.
+10. Sync the rollout engine with the latest policy weights.
+11. Log metrics, run validation, and save checkpoints on the same driver-owned path.
 
-## What nanoverl does NOT try to simplify aggressively
+This ordering is the main thing `nanoverl` tries to preserve and keep readable.
 
-Some components are important for a full pipeline, but are **not the main target of “nano”-ization** in this project:
+## Supported Paths
 
-- inference engine integration
-- generation backend details
-- SFT training pipeline
-- highly specialized or production-only serving logic
+The repository currently has these meaningful paths:
 
-For these parts, `nanoverl` may:
+- `debug` worker + `debug` rollout
+  - Small smoke-test path with no heavy runtime dependency expectations.
+- local HF policy / reference / value + HF rollout
+  - The clearest fully local real-training path.
+- single-node FSDP workers + HF rollout
+  - The first serious multi-GPU training slice.
+- local HF or FSDP training workers + local `vllm` rollout
+  - A thin rollout backend extension that reuses the same trainer loop.
 
-- reuse mature components directly
-- wrap existing implementations with thinner interfaces
-- keep only the minimum integration needed by RL training
-- omit SFT entirely in the first versions
+## Not Yet Supported
 
-In other words, `nanoverl` is **RL-first**, not a full reimplementation of every feature in `verl`.
+These should be treated as intentionally missing, intentionally thin, or future work:
 
-## Design Principles
+- async trainers
+- off-policy trainers
+- full Ray worker orchestration
+- multi-turn tool rollout
+- multiple mature rollout runtimes with parity guarantees
+- production-scale serving workflows
+- a full SFT stack
 
-`nanoverl` follows several design principles:
+## Roadmap Snapshot
 
-### 1. RL-first
-The primary goal is to support research on RL algorithms for LLMs, not to support every possible training mode.
+The current roadmap can be summarized as:
 
-### 2. Fewer abstractions, clearer boundaries
-Every major concept should map to a small number of files and explicit interfaces.
+1. Keep the synchronous RL core small and correct.
+2. Make PPO / GRPO research work comfortable on top of the same core contracts.
+3. Add backend breadth only when it materially expands research coverage.
+4. Avoid reintroducing `verl`-style complexity unless it clearly pays for itself.
 
-### 3. One obvious path
-Whenever possible, prefer one clean default implementation over many equivalent code paths.
+Near-term priorities are still:
 
-### 4. Preserve real usability
-The framework must remain usable for actual experiments, not just for demonstration.
-
-### 5. Easy to read, easy to hack
-A new reader should be able to trace one full RL run from config to rollout to update without getting lost.
-
-## Scope
-
-### In scope
-- PPO-like RL training for LLMs
-- clean trainer loop
-- actor / critic / reward / rollout abstractions
-- minimal distributed orchestration required by the RL pipeline
-- checkpointing / logging / config system
-- evaluation hooks useful for RL research
-
-### Out of scope or de-prioritized
-- full SFT pipeline
-- all historical / legacy backends
-- all duplicated launcher or worker variants
-- every optimization path from `verl`
-- production-serving-oriented code
-- heavy compatibility layers unless clearly necessary
-
-## Expected Output of the Project
-
-The expected result is a framework that:
-
-- can run real RL training jobs
-- is significantly easier to read than `verl`
-- has a smaller and cleaner architecture
-- is easier to modify for algorithm research
-- can serve as a strong codebase for learning, experimentation, and secondary development
-
-## Relationship to verl
-
-`nanoverl` is inspired by and structurally grounded in `verl`, but it is **not intended to be a line-by-line copy**.
-
-The guiding rule is:
-
-> preserve the essential RL functionality, while rewriting the codebase into a clearer and more research-friendly form.
-
-Some modules may be reimplemented from scratch.  
-Some may be lightly wrapped around existing implementations.  
-Some may be removed if they do not serve the core RL research workflow.
-
-## Development Philosophy
-
-The project will be developed in phases:
-
-1. understand the original `verl` RL pipeline
-2. identify the truly essential modules
-3. define a compact architecture for `nanoverl`
-4. implement a minimal but usable end-to-end RL path
-5. add necessary engineering support without reintroducing bloat
-
-The first priority is always:
-
-- correctness
-- clarity
-- maintainability
-
-not feature count.
-
-## Who is this for?
-
-`nanoverl` is mainly for:
-
-- researchers studying RL for LLMs
-- students learning RLHF / policy optimization systems
-- developers who want a clean base for RL algorithm experimentation
-- people who find the original `verl` too large to modify comfortably
-
-## Current Scaffold
-
-The repository now includes the first implementation pass of the planned architecture:
-
-- `nanoverl.core.RLBatch`
-  - a small RL-focused batch object with `repeat`, `union`, `chunk`, `concat`, `reorder`, and `pad_to_divisor`
-- `nanoverl.config.TrainerConfig`
-  - one typed config tree for the trainer, algorithm, actor, critic, reference, rollout, reward, and runtime
-- `nanoverl.trainer.RLTrainer`
-  - a driver-owned synchronous control loop in the intended PPO order:
-    rollout -> reward -> old/ref/value passes -> advantages -> critic -> actor -> rollout sync
-- `nanoverl.reward.RewardManager`
-  - a Python reward interface that expands scalar rewards into terminal-token reward tensors
-- `nanoverl.rollout.DebugRolloutEngine`
-  - a deterministic rollout backend for smoke tests and algorithm debugging
-- `nanoverl.workers.Debug*Worker`
-  - explicit policy, reference, and value worker boundaries
-- `nanoverl.checkpoint.CheckpointManager`
-  - local save/resume of trainer and worker state
-
-This is intentionally a clean, readable RL core. The debug and local HF paths are runnable today, the first single-node FSDP training path exists, and a thin synchronous `vllm` rollout backend can now be paired with the existing HF or FSDP training workers without changing the trainer loop.
+- cleaner core abstractions
+- correct and maintainable RL math
+- reliable single-node training
+- better experiment ergonomics
 
 ## Quickstart
 
-Run the built-in debug PPO example:
+Debug PPO:
 
 ```bash
 python3 -m nanoverl.cli.train_rl --config examples/configs/debug_ppo.json
 ```
 
-Run the local HF PPO example:
+Local HF PPO:
 
 ```bash
 python3 -m nanoverl.cli.train_rl --config examples/configs/hf_local_ppo.json
 ```
 
-Run the first single-node FSDP training preset:
+Single-node FSDP PPO:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 -m nanoverl.cli.train_rl --config examples/configs/fsdp_single_node_ppo.json
 ```
 
-Run the local HF actor plus vLLM rollout preset:
+Run tests:
 
 ```bash
-source /opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh
-conda activate vllm
-python3 -m nanoverl.cli.train_rl --config examples/configs/hf_vllm_local_ppo.json
+python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Run the GSM8K GRPO example with explicit local device placement:
+## Maintenance Rule
 
-```bash
-python3 examples/data_preprocess/gsm8k.py --local_save_dir examples/GSM8K/processed
-python3 -m nanoverl.cli.train_rl --config examples/configs/Qwen2.5-0.8B-GSM8K-GRPO.json
-```
+`README.md` is the single long-term project document.
 
-The packaged CLI aliases are:
+From now on:
 
-```bash
-nanoverl-train --config examples/configs/debug_ppo.json
-nanoverl-train-rl --config examples/configs/debug_ppo.json
-```
+- do not maintain a second architecture overview in `docs/`
+- update this README whenever the repo structure changes
+- update this README whenever the supported capability boundary changes
+- update this README whenever the project phase or roadmap emphasis changes
 
-Run the test suite:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-## Notes On Dependencies
-
-The repository is implemented to:
-
-- run the debug path with only the Python standard library
-- keep `torch`/`ray` as explicit optional dependencies in `pyproject.toml`
-- expose a real local HF path, a first single-node FSDP path, and a thin synchronous `vllm` rollout path before adding heavier runtime layers such as Ray
-
-The current `vllm` rollout slice is intentionally small:
-
-- synchronous only
-- same rollout contract as the real HF engine
-- no async server mode
-- no Ray rollout workers
-- no multi-turn / tool rollout
-- rollout tensor parallel size currently stays at `1` in this thin local design
-
-## Data And Device Notes
-
-The built-in loader currently expects `.json` or `.jsonl` rows. The most useful fields are:
-
-- `prompt`
-- `expected_response`
-- `data_source`
-- `reward_model`
-- `extra_info`
-
-`prompt` can be either:
-
-- a plain string, or
-- a chat-style message list when the tokenizer provides a chat template
-
-Real HF and vLLM rollout engines now return:
-
-- `prompts`
-- `responses`
-- `input_ids`
-- `attention_mask`
-- `response_mask`
-- `response_text`
-
-They do not compute `rollout_log_probs`; the trainer recomputes `old_log_probs` through the policy worker.
-
-For local HF execution, you can now place components explicitly:
-
-```json
-{
-  "actor": {"backend": "hf", "device": "cuda:0"},
-  "reference": {"backend": "hf", "device": "cuda:0"},
-  "critic": {"backend": "hf", "device": "cuda:0"},
-  "rollout": {"backend": "hf", "device": "cuda:1"}
-}
-```
-
-For `fsdp`, actor/reference/critic placement is still rank-owned by the distributed runtime, so only local rollout device placement is relevant there.
+If a reader wants to understand what `nanoverl` is doing, this file should be enough to get oriented quickly.

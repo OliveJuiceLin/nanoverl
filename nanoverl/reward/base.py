@@ -76,7 +76,8 @@ class RewardManager:
         token_level_scores: List[List[float]] = []
         extras: Dict[str, List[Any]] = {}
         for index in range(len(batch)):
-            row = batch.row(index)
+            row = {key: values[index] for key, values in batch.batch.items()}
+            row.update({key: values[index] for key, values in batch.non_tensor.items()})
             score, extra_payload = _parse_reward_output(
                 self.reward_fn(prompt_values[index], response_texts[index], row)
             )

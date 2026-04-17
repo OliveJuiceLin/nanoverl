@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 Matrix = Sequence[Sequence[float]]
+
+
+def _is_tensor_like(value: Any) -> bool:
+    return hasattr(value, "detach") and hasattr(value, "shape")
 
 
 def _masked_values(values: Matrix, mask: Sequence[Sequence[int]]) -> List[float]:
@@ -19,6 +23,8 @@ def _masked_values(values: Matrix, mask: Sequence[Sequence[int]]) -> List[float]
 
 
 def masked_mean(values: Matrix, mask: Sequence[Sequence[int]]) -> float:
+    if _is_tensor_like(values):
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
     flattened = _masked_values(values, mask)
     return sum(flattened) / max(len(flattened), 1)
 
@@ -31,6 +37,30 @@ def aggregate_loss(
 ) -> float:
     if loss_agg_mode == "token-mean":
         return masked_mean(loss_matrix, response_mask)
+
+    if _is_tensor_like(loss_matrix):
+        import torch
+
+        per_sequence_losses = []
+        per_sequence_lengths: List[float] = []
+        for row, mask_row in zip(loss_matrix, response_mask):
+            valid = row[mask_row > 0]
+            if valid.numel() == 0:
+                continue
+            per_sequence_losses.append(valid.sum())
+            per_sequence_lengths.append(float(valid.numel()))
+        if not per_sequence_losses:
+            return loss_matrix.new_tensor(0.0)
+        stacked_losses = torch.stack(per_sequence_losses)
+        if loss_agg_mode == "seq-mean-token-sum":
+            return stacked_losses.mean()
+        if loss_agg_mode == "seq-mean-token-mean":
+            means = torch.stack([loss / length for loss, length in zip(per_sequence_losses, per_sequence_lengths)])
+            return means.mean()
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            scale = float(loss_scale_factor or max(per_sequence_lengths))
+            return stacked_losses.mean() / scale
+        raise ValueError("Unsupported loss_agg_mode: %s" % loss_agg_mode)
 
     per_sequence_losses: List[float] = []
     per_sequence_lengths: List[int] = []
@@ -69,6 +99,28 @@ def compute_policy_loss(
 ) -> Tuple[float, Dict[str, float]]:
     clip_low = cliprange if cliprange_low is None else cliprange_low
     clip_high = cliprange if cliprange_high is None else cliprange_high
+
+    if _is_tensor_like(old_log_probs):
+        ratio = (log_probs - old_log_probs).exp()
+        unclipped = -advantages * ratio
+        clipped_ratio = ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high)
+        clipped = -advantages * clipped_ratio
+        candidate = unclipped.maximum(clipped)
+        lower_clipped = (-advantages * clip_ratio_c).minimum(candidate)
+        final_loss = candidate.where(advantages >= 0.0, lower_clipped)
+        valid_token_count = response_mask.sum().clamp_min(1.0)
+        clip_fraction = ((clipped > unclipped).float() * response_mask).sum() / valid_token_count
+        lower_clip_fraction = (
+            (((advantages < 0.0) & (lower_clipped < candidate)).float() * response_mask).sum()
+            / valid_token_count
+        )
+        approx_kl = masked_mean(-(log_probs - old_log_probs), response_mask)
+        loss = aggregate_loss(final_loss, response_mask, loss_agg_mode, loss_scale_factor)
+        return loss, {
+            "policy_clipfrac": float(clip_fraction.detach().cpu()),
+            "policy_clipfrac_lower": float(lower_clip_fraction.detach().cpu()),
+            "policy_approx_kl": float(approx_kl.detach().cpu()),
+        }
 
     loss_matrix: List[List[float]] = []
     approx_kl_matrix: List[List[float]] = []
@@ -117,6 +169,15 @@ def compute_value_loss(
     cliprange_value: float,
     loss_agg_mode: str = "token-mean",
 ) -> Tuple[float, Dict[str, float]]:
+    if _is_tensor_like(values):
+        clipped_values = values.clamp(min=returns - cliprange_value, max=returns + cliprange_value)
+        squared_error = (values - returns) ** 2
+        clipped_squared_error = (clipped_values - returns) ** 2
+        loss_matrix = squared_error.maximum(clipped_squared_error)
+        loss = aggregate_loss(loss_matrix, response_mask, loss_agg_mode)
+        abs_error = masked_mean((returns - values).abs(), response_mask)
+        return loss, {"value_abs_error": float(abs_error.detach().cpu())}
+
     loss_matrix: List[List[float]] = []
     abs_errors: List[float] = []
     for value_row, return_row, mask_row in zip(values, returns, response_mask):

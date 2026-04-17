@@ -5,6 +5,8 @@ from __future__ import annotations
 import random
 from typing import Any, Dict, List, Optional
 
+from nanoverl.algos.kl import compute_kl_penalty
+from nanoverl.algos.ppo import compute_policy_loss, compute_value_loss, masked_mean
 from nanoverl.backends.hf import (
     average_or_zero,
     batch_lists_to_tensor,
@@ -22,102 +24,6 @@ from nanoverl.backends.hf import (
     tensor_to_list_rows,
 )
 from nanoverl.workers.base import LogProbResult, PolicyWorker, ReferenceWorker, UpdateResult, ValueResult, ValueWorker
-
-
-def _masked_mean(values, mask) -> torch.Tensor:
-    return (values * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-def _aggregate_loss(loss_matrix, response_mask, loss_agg_mode: str) -> torch.Tensor:
-    torch, _, _, _ = require_hf_dependencies()
-    if loss_agg_mode == "token-mean":
-        return _masked_mean(loss_matrix, response_mask)
-
-    per_sequence_losses = []
-    token_counts = []
-    for row_loss, row_mask in zip(loss_matrix, response_mask):
-        valid_loss = row_loss[row_mask > 0]
-        if valid_loss.numel() == 0:
-            continue
-        per_sequence_losses.append(valid_loss.sum()) # 每一行的损失总和，即每个序列的总损失。
-        token_counts.append(float(valid_loss.numel())) # 每一行中有效 token 的数量，即每个序列中参与计算损失的 token 数量。
-    if not per_sequence_losses:
-        return torch.tensor(0.0, device=loss_matrix.device)
-
-    stacked_losses = torch.stack(per_sequence_losses)
-    if loss_agg_mode == "seq-mean-token-sum":
-        return stacked_losses.mean()
-    if loss_agg_mode == "seq-mean-token-mean":
-        sequence_means = torch.stack([loss / count for loss, count in zip(per_sequence_losses, token_counts)])
-        return sequence_means.mean()
-    if loss_agg_mode == "seq-mean-token-sum-norm":
-        return stacked_losses.mean() / max(token_counts)
-    raise ValueError("Unsupported loss_agg_mode: %s" % loss_agg_mode)
-
-
-def _compute_policy_loss(
-    current_log_probs,
-    old_log_probs,
-    advantages,
-    response_mask,
-    clip_ratio: float,
-    clip_ratio_low: Optional[float],
-    clip_ratio_high: Optional[float],
-    clip_ratio_c: float,
-    loss_agg_mode: str,
-):
-    # 设定策略更新的允许范围，例如 $0.2$，即新策略的概率只能在旧策略的 $[0.8, 1.2]$ 之间浮动。
-    clip_low = clip_ratio if clip_ratio_low is None else clip_ratio_low
-    clip_high = clip_ratio if clip_ratio_high is None else clip_ratio_high
-    
-    # 计算当前策略和旧策略的概率比值 $\frac{\pi_{new}}{\pi_{old}}$，通过对数概率的差值取指数实现。这里还对差值进行了裁剪，以避免数值不稳定。只在差别过大时候才进行裁剪，正常情况下如果差别不大，裁剪不会有任何影响。
-    # probability_ratio = (current_log_probs - old_log_probs).clamp(min=-20.0, max=20.0).exp() 
-    probability_ratio = (current_log_probs - old_log_probs).exp()
-    unclipped_loss = -advantages * probability_ratio
-    clipped_ratio = probability_ratio.clamp(min=1.0 - clip_low, max=1.0 + clip_high) # 对概率比值进行裁剪，使其在 $[1 - \epsilon, 1 + \epsilon]$ 的范围内，其中 $\epsilon$ 是 clip_ratio。这是 PPO 的核心机制之一，旨在限制策略更新的幅度，防止过大的更新导致训练不稳定。
-    clipped_loss = -advantages * clipped_ratio # 计算裁剪后的损失，即使用裁剪后的概率比值来计算损失。
-    clipped_candidate = clipped_loss.maximum(unclipped_loss) # PPO 的损失函数是 unclipped_loss 和 clipped_loss 中的较大者，这样可以确保在概率比值超过裁剪范围时，损失不会继续增加，从而限制了策略更新的幅度。
-    
-    lower_clipped_loss = (-advantages * clip_ratio_c).minimum(clipped_candidate) # 这个部分是对负优势（即新策略表现更差的情况）进行额外的裁剪，防止策略更新过度惩罚那些表现更差的动作。clip_ratio_c 是一个额外的裁剪参数，用于控制这种情况的损失。
-    final_loss = clipped_candidate.where(advantages >= 0.0, lower_clipped_loss) # 如果优势大于等于 0（表现好于平均）：说明这是一个好动作，我们希望新策略尽量提高它的出现概率。此时不需要什么“最大惩罚上限”，直接使用常规的截断损失；如果优势小于 0（表现差于平均）：触发保护机制，如果惩罚过大就会被 lower_clipped_loss 截断，防止梯度被单一极端的负优势样本主导。
-    masked_loss = final_loss * response_mask # TODO: 不需要在这里乘以response_mask，因为在之后的 aggrate 中会处理，未来可以简化逻辑，直接传入 final_loss 和 response_mask 到  _aggregate_loss 中，让它来处理掩码和聚合的逻辑。
-    aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode) # 根据 loss_agg_mode 的不同，对损失进行不同方式的聚合，例如按 token 平均、按序列平均等。
-
-    valid_token_count = response_mask.sum().clamp_min(1.0)
-    clip_fraction = ((clipped_loss > unclipped_loss).float() * response_mask).sum() / valid_token_count
-    lower_clip_fraction = (
-        (((advantages < 0.0) & (lower_clipped_loss < clipped_candidate)).float() * response_mask).sum()
-        / valid_token_count
-    )
-    approx_kl = _masked_mean(-(current_log_probs - old_log_probs), response_mask)
-    return aggregate, {
-        "policy_clipfrac": float(clip_fraction.detach().cpu()),
-        "policy_clipfrac_lower": float(lower_clip_fraction.detach().cpu()),
-        "policy_approx_kl": float(approx_kl.detach().cpu()),
-    }
-
-
-def _compute_value_loss(values, returns, response_mask, cliprange_value: float, loss_agg_mode: str):
-    clipped_values = values.clamp(min=returns - cliprange_value, max=returns + cliprange_value)
-    squared_error = (values - returns) ** 2
-    clipped_squared_error = (clipped_values - returns) ** 2
-    masked_loss = squared_error.maximum(clipped_squared_error) * response_mask
-    aggregate = _aggregate_loss(masked_loss, response_mask, loss_agg_mode)
-    absolute_error = ((returns - values).abs() * response_mask).sum() / response_mask.sum().clamp_min(1.0)
-    return aggregate, {"value_abs_error": float(absolute_error.detach().cpu())}
-
-
-def _compute_kl_penalty(log_probs, ref_log_probs, mode: str = "low_var_kl"):
-    if mode in {"kl", "k1"}:
-        return log_probs - ref_log_probs
-    if mode == "abs":
-        return (log_probs - ref_log_probs).abs()
-    if mode in {"mse", "k2"}:
-        return 0.5 * ((log_probs - ref_log_probs) ** 2)
-    if mode in {"low_var_kl", "k3"}:
-        diff = log_probs - ref_log_probs
-        return (-diff).exp() + diff - 1.0
-    raise ValueError("Unsupported KL penalty mode: %s" % mode)
 
 
 def _infer_hidden_size(backbone_config) -> int:
@@ -255,8 +161,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
         self.model.eval()
         all_log_probs = []
         with self._no_grad():
-            minibatches = list(self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, shuffle=False))
-            for minibatch in minibatches:
+            for minibatch in self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, shuffle=False):
                 response_log_probs, _ = self._compute_response_log_probs_and_entropy(
                     self.model, minibatch, compute_entropy=False
                 )
@@ -273,9 +178,8 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
         self.model.train()
 
         for _ in range(self.actor_config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
-            minibatches = list(self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, self.actor_config.shuffle))
-            for minibatch in minibatches: # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
-                microbatches = list(self._iter_microbatches(minibatch, self.actor_config.micro_batch_size))
+            for minibatch in self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, self.actor_config.shuffle): # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
+                microbatches = tuple(self._iter_microbatches(minibatch, self.actor_config.micro_batch_size))
                 if not microbatches:
                     continue
 
@@ -291,20 +195,23 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                         microbatch,
                         compute_entropy=self.actor_config.entropy_coeff != 0.0,
                     )
-                    training_tensors = build_training_tensors(microbatch, self.device)
-                    policy_loss, step_metrics = _compute_policy_loss(
-                        current_log_probs=current_log_probs,
+                    field_names = ["old_log_probs", "advantages"]
+                    if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
+                        field_names.append("ref_log_probs")
+                    training_tensors = build_training_tensors(microbatch, self.device, field_names=field_names)
+                    policy_loss, step_metrics = compute_policy_loss(
                         old_log_probs=training_tensors["old_log_probs"],
+                        log_probs=current_log_probs,
                         advantages=training_tensors["advantages"],
                         response_mask=training_tensors["response_mask"],
-                        clip_ratio=self.actor_config.clip_ratio,
-                        clip_ratio_low=self.actor_config.clip_ratio_low,
-                        clip_ratio_high=self.actor_config.clip_ratio_high,
+                        cliprange=self.actor_config.clip_ratio,
+                        cliprange_low=self.actor_config.clip_ratio_low,
+                        cliprange_high=self.actor_config.clip_ratio_high,
                         clip_ratio_c=self.actor_config.clip_ratio_c,
                         loss_agg_mode=self.actor_config.loss_agg_mode,
                     )
                     if current_entropy is not None:
-                        entropy_bonus = _masked_mean(current_entropy, training_tensors["response_mask"])
+                        entropy_bonus = masked_mean(current_entropy, training_tensors["response_mask"])
                         total_loss = policy_loss - (self.actor_config.entropy_coeff * entropy_bonus)
                         step_metrics["policy_entropy"] = float(entropy_bonus.detach().cpu())
                     else:
@@ -312,12 +219,12 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                         step_metrics["policy_entropy"] = 0.0
 
                     if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
-                        kl_penalty = _compute_kl_penalty(
+                        kl_penalty = compute_kl_penalty(
                             current_log_probs,
                             training_tensors["ref_log_probs"],
                             mode="low_var_kl",
                         )
-                        kl_mean = _masked_mean(kl_penalty, training_tensors["response_mask"])
+                        kl_mean = masked_mean(kl_penalty, training_tensors["response_mask"])
                         total_loss = total_loss + (self.actor_config.kl_loss_coef * kl_mean)
                         step_metrics["actor_kl_loss"] = float(kl_mean.detach().cpu())
 
@@ -408,7 +315,7 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
         for _ in range(self.value_config.ppo_epochs):
             minibatches = self._iter_minibatches(batch, self.value_config.ppo_mini_batch_size, self.value_config.shuffle)
             for minibatch in minibatches:
-                microbatches = list(self._iter_microbatches(minibatch, self.value_config.micro_batch_size))
+                microbatches = tuple(self._iter_microbatches(minibatch, self.value_config.micro_batch_size))
                 if not microbatches:
                     continue
 
@@ -420,8 +327,8 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
                 self.optimizer.zero_grad()
                 for microbatch, microbatch_weight in zip(microbatches, microbatch_weights):
                     predicted_values = self._compute_response_values(microbatch)
-                    training_tensors = build_training_tensors(microbatch, self.device)
-                    value_loss, step_metrics = _compute_value_loss(
+                    training_tensors = build_training_tensors(microbatch, self.device, field_names=("returns",))
+                    value_loss, step_metrics = compute_value_loss(
                         values=predicted_values,
                         returns=training_tensors["returns"],
                         response_mask=training_tensors["response_mask"],

@@ -104,7 +104,6 @@ class SamplingConfig:
 
 @dataclass
 class AlgorithmConfig:
-    name: str = "ppo"
     advantage_estimator: str = "gae"
     gamma: float = 1.0
     lam: float = 1.0
@@ -241,6 +240,7 @@ class TrainerConfig:
             trainer=_coerce_dataclass(TrainerRuntimeConfig, data.get("trainer")),
             ray=_coerce_dataclass(RayConfig, data.get("ray")),
         )
+        cfg._apply_derived_defaults()
         cfg.validate()
         return cfg
 
@@ -256,6 +256,15 @@ class TrainerConfig:
             return self.trainer.total_training_steps
         return train_batches_per_epoch * self.trainer.total_epochs
 
+    def _apply_derived_defaults(self) -> None:
+        """它在配置对象实例化后，负责自动补全那些“取决于其他配置项”的默认值，以保证配置组合的合理性与一致性"""
+        if self.rollout.backend in {"hf", "vllm"} and self.model.tokenizer_path is None:
+            self.model.tokenizer_path = self.model.path
+        if self.trainer.validate_only:
+            self.trainer.validate_before_train = True
+        if self.rollout.balance_by_length:
+            self.trainer.balance_batch = True
+
     def validate(self) -> None:
         if self.data.train_batch_size <= 0:
             raise ConfigError("data.train_batch_size must be positive.")
@@ -265,8 +274,8 @@ class TrainerConfig:
             raise ConfigError("data.max_prompt_length must be positive.")
         if self.data.max_response_length <= 0:
             raise ConfigError("data.max_response_length must be positive.")
-        if self.algorithm.name not in {"ppo", "grpo"}:
-            raise ConfigError("algorithm.name must be either 'ppo' or 'grpo'.")
+        if self.algorithm.advantage_estimator not in {"gae", "grpo"}:
+            raise ConfigError("algorithm.advantage_estimator must be either 'gae' or 'grpo'.")
         if self.rollout.train.n <= 0:
             raise ConfigError("rollout.train.n must be positive.")
         if self.rollout.validation.n <= 0:
@@ -293,7 +302,7 @@ class TrainerConfig:
             raise ConfigError("actor.ppo_mini_batch_size must be positive.")
         if self.actor.micro_batch_size is not None and self.actor.micro_batch_size <= 0:
             raise ConfigError("actor.micro_batch_size must be positive when set.")
-        uses_critic = self.critic.enable and self.algorithm.advantage_estimator != "grpo" and self.algorithm.name != "grpo"
+        uses_critic = self.critic.enable and self.algorithm.advantage_estimator != "grpo"
         if self.actor.micro_batch_size is not None:
             if self.actor.micro_batch_size > self.actor.ppo_mini_batch_size:
                 raise ConfigError("actor.micro_batch_size must not exceed actor.ppo_mini_batch_size.")
@@ -308,8 +317,6 @@ class TrainerConfig:
                 raise ConfigError("critic.micro_batch_size must not exceed critic.ppo_mini_batch_size.")
             if self.critic.ppo_mini_batch_size % self.critic.micro_batch_size != 0:
                 raise ConfigError("critic.ppo_mini_batch_size must be divisible by critic.micro_batch_size.")
-        if self.algorithm.name == "grpo" and self.algorithm.advantage_estimator == "gae":
-            self.algorithm.advantage_estimator = "grpo"
         if self.algorithm.advantage_estimator == "grpo" and self.rollout.train.n < 2:
             raise ConfigError("GRPO requires rollout.train.n >= 2.")
         if self.algorithm.advantage_estimator == "grpo" and self.actor.ppo_mini_batch_size % self.rollout.train.n != 0:
@@ -322,8 +329,6 @@ class TrainerConfig:
             raise ConfigError("Reference worker must be enabled when actor KL loss is enabled.")
         if self.trainer.validate_only and not self.data.val_path:
             raise ConfigError("trainer.validate_only requires data.val_path.")
-        if self.trainer.validate_only:
-            self.trainer.validate_before_train = True
         if self.trainer.test_freq > 0 and not self.data.val_path:
             raise ConfigError("trainer.test_freq requires data.val_path.")
         if self.trainer.validation_dump_freq > 0 and not self.data.val_path:
@@ -352,10 +357,6 @@ class TrainerConfig:
             # rollout needs a larger weight-transfer/runtime design than we want here.
             if self.rollout.tensor_model_parallel_size != 1:
                 raise ConfigError("rollout.tensor_model_parallel_size is currently supported only for value 1.")
-        if self.rollout.backend in {"hf", "vllm"} and self.model.tokenizer_path is None:
-            self.model.tokenizer_path = self.model.path
-        if self.rollout.balance_by_length:
-            self.trainer.balance_batch = True
         if self.trainer.balance_batch and uses_critic:
             if self.actor.ppo_mini_batch_size != self.critic.ppo_mini_batch_size:
                 raise ConfigError(

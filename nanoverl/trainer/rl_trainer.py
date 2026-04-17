@@ -268,7 +268,7 @@ class RLTrainer:
         if reordered_indices == list(range(len(batch))):
             return batch
 
-        balanced_batch = batch.reorder(reordered_indices)
+        balanced_batch = batch.select(reordered_indices)
         balanced_batch.meta["balanced_by_length"] = True
         return balanced_batch
 
@@ -512,7 +512,13 @@ class RLTrainer:
             )
         )
         metrics.update(compute_timing_metrics(timing))
-        metrics.update(compute_throughput_metrics(rollout_batch, timing["step"], world_size=1))
+        metrics.update(
+            compute_throughput_metrics(
+                rollout_batch,
+                timing["step"],
+                world_size=self.runtime.world_size,
+            )
+        )
         metrics["training/global_step"] = float(self.global_step)
         metrics["training/epoch"] = float(self.train_loader.epoch)
         self._maybe_dump_train_preview(rollout_batch, self.global_step + 1)

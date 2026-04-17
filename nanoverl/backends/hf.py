@@ -217,19 +217,23 @@ def get_response_lengths(batch) -> List[int]:
     return [sum(int(token_mask) for token_mask in response_mask) for response_mask in batch.batch["response_mask"]]
 
 
-def build_training_tensors(batch, device):
+def build_training_tensors(batch, device, field_names: Sequence[str] = ()):
     """
     Function:
-        - 从batch中提取训练所需的各种张量，包括response_mask、old_log_probs、advantages、returns和ref_log_probs，并将它们转换为适当的PyTorch张量，准备好在训练过程中使用。
+        - 从 batch 中提取训练所需的张量，并将它们转换为适合训练的 PyTorch 张量。
     """
     torch, _, _, _ = require_hf_dependencies()
-    return {
+    tensors = {
         "response_mask": batch_lists_to_tensor(batch.batch["response_mask"], 0, device=device, dtype=torch.float32),
-        "old_log_probs": batch_lists_to_tensor(batch.batch.get("old_log_probs", []), 0.0, device=device, dtype=torch.float32),
-        "advantages": batch_lists_to_tensor(batch.batch.get("advantages", []), 0.0, device=device, dtype=torch.float32),
-        "returns": batch_lists_to_tensor(batch.batch.get("returns", []), 0.0, device=device, dtype=torch.float32),
-        "ref_log_probs": batch_lists_to_tensor(batch.batch.get("ref_log_probs", []), 0.0, device=device, dtype=torch.float32),
     }
+    for field_name in field_names:
+        tensors[field_name] = batch_lists_to_tensor(
+            batch.batch.get(field_name, []),
+            0.0,
+            device=device,
+            dtype=torch.float32,
+        )
+    return tensors
 
 
 def extract_response_stats(

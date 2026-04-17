@@ -137,7 +137,6 @@ class VLLMBackendTest(unittest.TestCase):
                     "dtype": "float32",
                 },
                 "algorithm": {
-                    "name": "ppo",
                     "advantage_estimator": "gae",
                 },
                 "actor": {

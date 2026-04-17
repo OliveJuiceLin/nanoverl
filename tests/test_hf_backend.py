@@ -102,7 +102,6 @@ class HFBackendTest(unittest.TestCase):
                     "dtype": "float32",
                 },
                 "algorithm": {
-                    "name": "ppo",
                     "advantage_estimator": "gae",
                     "use_kl_in_reward": True,
                     "kl_penalty": "low_var_kl",

@@ -41,17 +41,20 @@ class DebugRolloutEngine(RolloutEngine):
         response_texts: List[str] = []
 
         for index in range(len(batch)):
-            row = batch.row(index)
-            prompt_text = str(row.get("prompt_text") or row.get("prompt") or "")
-            rollout_index = int(row.get("rollout_index", 0))
-            scripted = row.get("scripted_responses") # scipted 意思是预先定义好的响应列表，可能是为了测试不同版本的响应或者模拟模型在不同采样版本下的输出。
+            prompt_text = str(
+                (batch.non_tensor.get("prompt_text", [None] * len(batch))[index])
+                or (batch.non_tensor.get("prompt", [None] * len(batch))[index])
+                or ""
+            )
+            rollout_index = int(batch.non_tensor.get("rollout_index", [0] * len(batch))[index])
+            scripted = batch.non_tensor.get("scripted_responses", [None] * len(batch))[index] # scipted 意思是预先定义好的响应列表，可能是为了测试不同版本的响应或者模拟模型在不同采样版本下的输出。
             # 这里的逻辑是：如果 scripted_responses 存在且是一个非空列表，就根据 rollout_index 从中选择一个响应文本；
             # 否则，如果 expected_response 存在，就使用它作为响应文本；
             # 如果两者都不存在，则使用一个默认的调试响应文本 "debug-response"。
             if isinstance(scripted, list) and scripted:
                 response_text = str(scripted[min(rollout_index, len(scripted) - 1)])
-            elif row.get("expected_response") is not None:
-                response_text = str(row["expected_response"])
+            elif batch.non_tensor.get("expected_response", [None] * len(batch))[index] is not None:
+                response_text = str(batch.non_tensor["expected_response"][index])
             else:
                 response_text = "debug-response"
             prompt_tokens = self._tokenize_text(prompt_text) # List[int]

@@ -53,7 +53,7 @@ class ConfigValidationTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             TrainerConfig.from_dict(
                 {
-                    "algorithm": {"name": "grpo"},
+                    "algorithm": {"advantage_estimator": "grpo"},
                     "rollout": {"train": {"n": 1}},
                 }
             )
@@ -192,7 +192,7 @@ class TrainerPhase2Test(unittest.TestCase):
                         "shuffle": False,
                     },
                     "algorithm": {
-                        "name": "grpo",
+                        "advantage_estimator": "grpo",
                     },
                     "actor": {
                         "backend": "debug",
