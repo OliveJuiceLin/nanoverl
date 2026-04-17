@@ -19,7 +19,7 @@ try:  # pragma: no cover - exercised only when optional deps are installed
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-    from nanoverl.backends.hf import encode_text, load_tokenizer, pack_prompt_response_tokens
+    from nanoverl.backends.hf import encode_text, load_tokenizer
     from nanoverl.rollout.hf import HFRolloutEngine
     from nanoverl.workers.hf import HFPolicyWorker, HFValueWorker
 
@@ -151,16 +151,19 @@ class HFBackendTest(unittest.TestCase):
         )
 
     def _make_batch(self, tokenizer, prompts, responses) -> RLBatch:
-        packed_rows = [
-            pack_prompt_response_tokens(
-                tokenizer=tokenizer,
-                prompt_token_ids=encode_text(tokenizer, prompt),
-                response_token_ids=encode_text(tokenizer, response),
-                max_prompt_length=8,
-                max_response_length=4,
+        packed_rows = []
+        for prompt, response in zip(prompts, responses):
+            prompt_token_ids = encode_text(tokenizer, prompt)
+            response_token_ids = encode_text(tokenizer, response)
+            packed_rows.append(
+                {
+                    "prompts": prompt_token_ids,
+                    "responses": response_token_ids,
+                    "input_ids": prompt_token_ids + response_token_ids,
+                    "attention_mask": [1] * (len(prompt_token_ids) + len(response_token_ids)),
+                    "response_mask": [1] * len(response_token_ids),
+                }
             )
-            for prompt, response in zip(prompts, responses)
-        ]
         return RLBatch(
             batch={
                 "prompts": [row["prompts"] for row in packed_rows],
@@ -175,24 +178,20 @@ class HFBackendTest(unittest.TestCase):
             },
         )
 
-    def test_pack_truncation_and_masks(self):
+    def test_manual_batch_contract_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             model_dir = self._make_model_dir(Path(tmpdir))
             tokenizer = load_tokenizer(
                 TrainerConfig.from_dict({"model": {"path": str(model_dir), "tokenizer_path": str(model_dir)}}).model
             )
-            packed = pack_prompt_response_tokens(
-                tokenizer=tokenizer,
-                prompt_token_ids=encode_text(tokenizer, "what is two plus two ? say yes"),
-                response_token_ids=encode_text(tokenizer, "answer four yes no"),
-                max_prompt_length=4,
-                max_response_length=2,
-            )
-            self.assertEqual(len(packed["prompts"]), 4)
-            self.assertEqual(len(packed["responses"]), 2)
-            self.assertEqual(len(packed["input_ids"]), 6)
-            self.assertEqual(packed["input_ids"], packed["prompts"] + packed["responses"])
-            self.assertEqual(packed["response_mask"], [1, 1])
+            prompt_token_ids = encode_text(tokenizer, "what is two plus two ? say yes")
+            response_token_ids = encode_text(tokenizer, "answer four yes no")
+            input_ids = prompt_token_ids + response_token_ids
+            attention_mask = [1] * len(input_ids)
+            response_mask = [1] * len(response_token_ids)
+            self.assertEqual(input_ids, prompt_token_ids + response_token_ids)
+            self.assertEqual(len(attention_mask), len(input_ids))
+            self.assertEqual(response_mask, [1] * len(response_token_ids))
 
     def test_worker_input_padding_uses_tokenizer_pad_id(self):
         with tempfile.TemporaryDirectory() as tmpdir:

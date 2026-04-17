@@ -109,38 +109,6 @@ def ensure_prompt_tokens(prompt_token_ids: Sequence[int], tokenizer) -> List[int
         if fallback_token_id is not None:
             return [int(fallback_token_id)]
     raise ValueError("Prompt text is empty and tokenizer has no usable fallback token.")
-
-
-def truncate_prompt(prompt_token_ids: Sequence[int], max_prompt_length: int) -> List[int]:
-    if max_prompt_length <= 0:
-        return []
-    return list(prompt_token_ids)[-max_prompt_length:]
-
-
-def truncate_response(response_token_ids: Sequence[int], max_response_length: int) -> List[int]:
-    if max_response_length <= 0:
-        return []
-    return list(response_token_ids[:max_response_length])
-
-
-def pack_prompt_response_tokens(
-    tokenizer,
-    prompt_token_ids: Sequence[int],
-    response_token_ids: Sequence[int],
-    max_prompt_length: int,
-    max_response_length: int,
-) -> Dict[str, List[int]]:
-    prompt_ids = truncate_prompt(ensure_prompt_tokens(prompt_token_ids, tokenizer), max_prompt_length)
-    response_ids = truncate_response(response_token_ids, max_response_length)
-    return {
-        "prompts": prompt_ids,
-        "responses": response_ids,
-        "input_ids": prompt_ids + response_ids,
-        "attention_mask": [1] * (len(prompt_ids) + len(response_ids)),
-        "response_mask": [1] * len(response_ids),
-    }
-
-
 def encode_text(tokenizer, text: str) -> List[int]:
     # encoded = tokenizer(text, add_special_tokens=False)
     # return list(encoded["input_ids"])

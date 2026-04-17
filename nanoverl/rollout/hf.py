@@ -8,9 +8,9 @@ from nanoverl.backends.hf import (
     batch_lists_to_tensor,
     clone_model_state,
     encode_text,
+    ensure_prompt_tokens,
     load_causal_lm,
     load_tokenizer,
-    pack_prompt_response_tokens,
     render_prompt_text,
     resolve_device,
     trim_generated_response,
@@ -44,14 +44,7 @@ class HFRolloutEngine(RolloutEngine):
         prompt_token_ids: List[List[int]] = []
         for prompt_value in prompt_values:
             prompt_text = render_prompt_text(self.tokenizer, prompt_value)
-            packed_prompt = pack_prompt_response_tokens(
-                tokenizer=self.tokenizer,
-                prompt_token_ids=encode_text(self.tokenizer, prompt_text),
-                response_token_ids=[],
-                max_prompt_length=self.data_config.max_prompt_length,
-                max_response_length=self.rollout_config.response_length,
-            )
-            prompt_token_ids.append(packed_prompt["prompts"])
+            prompt_token_ids.append(ensure_prompt_tokens(encode_text(self.tokenizer, prompt_text), self.tokenizer))
 
         prompt_input_ids = batch_lists_to_tensor(
             prompt_token_ids,
@@ -81,28 +74,30 @@ class HFRolloutEngine(RolloutEngine):
             generated_token_ids = self.model.generate(**generation_kwargs)
 
         padded_prompt_len = prompt_input_ids.shape[1]
-        packed_rows = []
+        prompts = []
+        responses = []
+        input_ids = []
+        attention_masks = []
+        response_masks = []
         response_texts = []
         for row_index, generated in enumerate(generated_token_ids):
             full_token_ids = generated.detach().cpu().tolist()
+            prompt_ids = prompt_token_ids[row_index]
             response_token_ids = trim_generated_response(self.tokenizer, full_token_ids[padded_prompt_len:])
-            packed_row = pack_prompt_response_tokens(
-                tokenizer=self.tokenizer,
-                prompt_token_ids=prompt_token_ids[row_index],
-                response_token_ids=response_token_ids,
-                max_prompt_length=self.data_config.max_prompt_length,
-                max_response_length=self.rollout_config.response_length,
-            )
-            packed_rows.append(packed_row)
-            response_texts.append(self.tokenizer.decode(packed_row["responses"], skip_special_tokens=True).strip())
+            prompts.append(prompt_ids)
+            responses.append(response_token_ids)
+            input_ids.append(prompt_ids + response_token_ids)
+            attention_masks.append([1] * (len(prompt_ids) + len(response_token_ids)))
+            response_masks.append([1] * len(response_token_ids))
+            response_texts.append(self.tokenizer.decode(response_token_ids, skip_special_tokens=True).strip())
 
         rollout_batch = RLBatch(
             batch={
-                "prompts": [row["prompts"] for row in packed_rows],
-                "responses": [row["responses"] for row in packed_rows],
-                "input_ids": [row["input_ids"] for row in packed_rows],
-                "attention_mask": [row["attention_mask"] for row in packed_rows],
-                "response_mask": [row["response_mask"] for row in packed_rows],
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_masks,
+                "response_mask": response_masks,
             },
             non_tensor={"response_text": response_texts},
             meta={"policy_sync_steps": self.policy_sync_steps},

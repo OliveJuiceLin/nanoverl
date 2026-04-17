@@ -15,7 +15,6 @@
     "dtype": "float32"
   },
   "algorithm": {
-    "name": "ppo",
     "advantage_estimator": "gae",
     "gamma": 1.0,
     "lam": 1.0,

@@ -18,7 +18,7 @@ try:  # pragma: no cover - exercised only when optional deps are installed
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-    from nanoverl.backends.hf import encode_text, load_tokenizer, pack_prompt_response_tokens
+    from nanoverl.backends.hf import encode_text, load_tokenizer
     from nanoverl.backends.train.fsdp import FSDPPolicyWorker, FSDPReferenceWorker, FSDPValueWorker
     from nanoverl.cli.train_rl import main as train_main
     from nanoverl.rollout.hf import HFRolloutEngine
@@ -79,16 +79,19 @@ class FSDPBackendTest(unittest.TestCase):
         return model_dir
 
     def _make_batch(self, tokenizer, prompts, responses) -> RLBatch:
-        packed_rows = [
-            pack_prompt_response_tokens(
-                tokenizer=tokenizer,
-                prompt_token_ids=encode_text(tokenizer, prompt),
-                response_token_ids=encode_text(tokenizer, response),
-                max_prompt_length=8,
-                max_response_length=4,
+        packed_rows = []
+        for prompt, response in zip(prompts, responses):
+            prompt_token_ids = encode_text(tokenizer, prompt)
+            response_token_ids = encode_text(tokenizer, response)
+            packed_rows.append(
+                {
+                    "prompts": prompt_token_ids,
+                    "responses": response_token_ids,
+                    "input_ids": prompt_token_ids + response_token_ids,
+                    "attention_mask": [1] * (len(prompt_token_ids) + len(response_token_ids)),
+                    "response_mask": [1] * len(response_token_ids),
+                }
             )
-            for prompt, response in zip(prompts, responses)
-        ]
         return RLBatch(
             batch={
                 "prompts": [row["prompts"] for row in packed_rows],

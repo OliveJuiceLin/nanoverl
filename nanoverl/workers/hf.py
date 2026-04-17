@@ -164,7 +164,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
             for minibatch in self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, shuffle=False):
                 response_log_probs, _ = self._compute_response_log_probs_and_entropy(
                     self.model, minibatch, compute_entropy=False
-                )
+                ) # 这里会有显存的上升
                 response_lengths = get_response_lengths(minibatch)
                 all_log_probs.extend(tensor_to_list_rows(response_log_probs, response_lengths))        
         return LogProbResult(

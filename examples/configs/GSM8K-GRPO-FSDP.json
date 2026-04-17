@@ -16,7 +16,6 @@
       "attn_implementation": "sdpa"
     },
     "algorithm": {
-      "name": "grpo",
       "advantage_estimator": "grpo",
       "norm_adv_by_std_in_grpo": true
     },

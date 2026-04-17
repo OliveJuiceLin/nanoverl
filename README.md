@@ -106,7 +106,6 @@ These should be treated as intentionally missing, intentionally thin, or future 
 - multi-turn tool rollout
 - multiple mature rollout runtimes with parity guarantees
 - production-scale serving workflows
-- a full SFT stack
 
 ## Roadmap Snapshot
 
@@ -156,7 +155,6 @@ python -m unittest discover -s tests -p 'test_*.py'
 
 From now on:
 
-- do not maintain a second architecture overview in `docs/`
 - update this README whenever the repo structure changes
 - update this README whenever the supported capability boundary changes
 - update this README whenever the project phase or roadmap emphasis changes

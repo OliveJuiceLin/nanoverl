@@ -6,8 +6,8 @@ from typing import Any, Dict, List
 
 from nanoverl.backends.hf import (
     encode_text,
+    ensure_prompt_tokens,
     load_tokenizer,
-    pack_prompt_response_tokens,
     render_prompt_text,
     resolve_device,
     trim_generated_response,
@@ -68,44 +68,39 @@ class VLLMRolloutEngine(RolloutEngine):
         prompt_inputs: List[Dict[str, List[int]]] = []
         for prompt_value in prompt_values:
             prompt_text = render_prompt_text(self.tokenizer, prompt_value)
-            packed_prompt = pack_prompt_response_tokens(
-                tokenizer=self.tokenizer,
-                prompt_token_ids=encode_text(self.tokenizer, prompt_text),
-                response_token_ids=[],
-                max_prompt_length=self.data_config.max_prompt_length,
-                max_response_length=self.rollout_config.response_length,
-            )
-            prompt_token_rows.append(packed_prompt["prompts"])
-            prompt_inputs.append({"prompt_token_ids": packed_prompt["prompts"]})
+            prompt_token_ids = ensure_prompt_tokens(encode_text(self.tokenizer, prompt_text), self.tokenizer)
+            prompt_token_rows.append(prompt_token_ids)
+            prompt_inputs.append({"prompt_token_ids": prompt_token_ids})
 
         request_outputs = self.llm.generate(
             prompt_inputs,
             sampling_params=build_vllm_sampling_params(sampling, self.rollout_config.response_length),
         )
 
-        packed_rows = []
+        prompts = []
+        responses = []
+        input_ids = []
+        attention_masks = []
+        response_masks = []
         response_texts = []
         for row_index, request_output in enumerate(request_outputs):
             completion_output = request_output.outputs[0]
-            packed_row = pack_prompt_response_tokens(
-                tokenizer=self.tokenizer,
-                prompt_token_ids=prompt_token_rows[row_index],
-                response_token_ids=trim_generated_response(self.tokenizer, completion_output.token_ids),
-                max_prompt_length=self.data_config.max_prompt_length,
-                max_response_length=self.rollout_config.response_length,
-            )
-            packed_rows.append(packed_row)
-            response_texts.append(
-                self.tokenizer.decode(packed_row["responses"], skip_special_tokens=True).strip()
-            )
+            prompt_ids = prompt_token_rows[row_index]
+            response_token_ids = trim_generated_response(self.tokenizer, completion_output.token_ids)
+            prompts.append(prompt_ids)
+            responses.append(response_token_ids)
+            input_ids.append(prompt_ids + response_token_ids)
+            attention_masks.append([1] * (len(prompt_ids) + len(response_token_ids)))
+            response_masks.append([1] * len(response_token_ids))
+            response_texts.append(self.tokenizer.decode(response_token_ids, skip_special_tokens=True).strip())
 
         rollout_batch = RLBatch(
             batch={
-                "prompts": [row["prompts"] for row in packed_rows],
-                "responses": [row["responses"] for row in packed_rows],
-                "input_ids": [row["input_ids"] for row in packed_rows],
-                "attention_mask": [row["attention_mask"] for row in packed_rows],
-                "response_mask": [row["response_mask"] for row in packed_rows],
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": input_ids,
+                "attention_mask": attention_masks,
+                "response_mask": response_masks,
             },
             non_tensor={"response_text": response_texts},
             meta={"policy_sync_steps": self.policy_sync_steps},
