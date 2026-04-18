@@ -36,6 +36,7 @@ def aggregate_loss(
     loss_scale_factor: Optional[int] = None,
 ) -> float:
     if loss_agg_mode == "token-mean":
+        # 每个 token 的地位是平等的。如果批次中有一条序列特别长，另一条特别短，长序列会对总 Loss 产生更大的主导影响。
         return masked_mean(loss_matrix, response_mask)
 
     if _is_tensor_like(loss_matrix):
@@ -51,10 +52,14 @@ def aggregate_loss(
             per_sequence_lengths.append(float(valid.numel()))
         if not per_sequence_losses:
             return loss_matrix.new_tensor(0.0)
-        stacked_losses = torch.stack(per_sequence_losses)
+        stacked_losses = torch.stack(per_sequence_losses) # shape [num_sequences]
         if loss_agg_mode == "seq-mean-token-sum":
+            # 首先对单条序列内部的所有有效 token 损失求和 (Sum)，得到该序列的总损失；然后将所有序列的总损失相加，除以序列数量 $N$ 做平均 (Mean)。
+            # 把“一条句子”当做优化的基本单位。因为是单句求和，生成的回复越长，该样本的损失绝对值通常越大，对应的梯度也越大。这可能会促使模型倾向于调整长句子的生成策略。
             return stacked_losses.mean()
         if loss_agg_mode == "seq-mean-token-mean":
+            # 首先对单条序列内部的所有有效 token 损失做内部平均 (Mean) $\big( \frac{1}{L_i} \sum l_{i,j} \big)$，得到该句子的平均 token 损失；然后再将这 $N$ 个平均值相加，除以序列数量 $N$ 做外部平均 (Mean)。
+            # 也是把“一条句子”当做优化的基本单位，但在求平均之前先对每条句子内部的 token loss 求平均。这样可以在一定程度上缓解长句子对总 Loss 的主导影响，因为每条句子的损失都是基于其平均 token loss 来计算的，而不是总和。
             means = torch.stack([loss / length for loss, length in zip(per_sequence_losses, per_sequence_lengths)])
             return means.mean()
         if loss_agg_mode == "seq-mean-token-sum-norm":
@@ -117,9 +122,9 @@ def compute_policy_loss(
         approx_kl = masked_mean(-(log_probs - old_log_probs), response_mask)
         loss = aggregate_loss(final_loss, response_mask, loss_agg_mode, loss_scale_factor)
         return loss, {
-            "policy_clipfrac": float(clip_fraction.detach().cpu()),
-            "policy_clipfrac_lower": float(lower_clip_fraction.detach().cpu()),
-            "policy_approx_kl": float(approx_kl.detach().cpu()),
+            "policy_clipfrac": float(clip_fraction.detach().cpu()), # 发生 PPO 标准“截断 (Clip)”的 token 占整体有效 token 的比例。
+            "policy_clipfrac_lower": float(lower_clip_fraction.detach().cpu()), # 发生“下限截断”的 token 占整体有效 token 的比例。
+            "policy_approx_kl": float(approx_kl.detach().cpu()), # 更新后的新策略（log_probs）相对于之前采样时的旧策略（old_log_probs）发生了多大变化的近似度量。
         }
 
     loss_matrix: List[List[float]] = []

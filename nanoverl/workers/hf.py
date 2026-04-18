@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional
 from nanoverl.algos.kl import compute_kl_penalty
 from nanoverl.algos.ppo import compute_policy_loss, compute_value_loss, masked_mean
 from nanoverl.backends.hf import (
-    average_or_zero,
     batch_lists_to_tensor,
     build_training_tensors,
     clone_model_state,
+    count_valid_tokens,
     extract_response_stats,
     get_loss_weight,
     get_prompt_lengths,
@@ -24,6 +24,53 @@ from nanoverl.backends.hf import (
     tensor_to_list_rows,
 )
 from nanoverl.workers.base import LogProbResult, PolicyWorker, ReferenceWorker, UpdateResult, ValueResult, ValueWorker
+
+
+_LOSS_WEIGHTED_METRICS = {"actor_loss", "critic_loss"}
+_TOKEN_WEIGHTED_METRICS = {
+    "actor_kl_loss",
+    "policy_approx_kl",
+    "policy_clipfrac",
+    "policy_clipfrac_lower",
+    "policy_entropy",
+    "value_abs_error",
+}
+
+
+def _metric_weight(metric_name: str, loss_weight: float, token_weight: float) -> float:
+    if metric_name in _LOSS_WEIGHTED_METRICS:
+        return float(loss_weight)
+    if metric_name in _TOKEN_WEIGHTED_METRICS:
+        return float(token_weight)
+    return 1.0
+
+
+class _MetricAccumulator:
+    def __init__(self):
+        self._weighted_sums: Dict[str, float] = {}
+        self._weights: Dict[str, float] = {}
+
+    def add(self, metric_name: str, metric_value: float, weight: float) -> None:
+        if metric_name not in self._weighted_sums:
+            self._weighted_sums[metric_name] = 0.0
+            self._weights[metric_name] = 0.0
+        self._weighted_sums[metric_name] += float(metric_value) * float(weight)
+        self._weights[metric_name] += float(weight)
+
+    def add_many(self, metrics: Dict[str, float], loss_weight: float, token_weight: float) -> None:
+        for metric_name, metric_value in metrics.items():
+            self.add(
+                metric_name,
+                float(metric_value),
+                _metric_weight(metric_name, loss_weight=loss_weight, token_weight=token_weight),
+            )
+
+    def finalize(self) -> Dict[str, float]:
+        finalized: Dict[str, float] = {}
+        for metric_name, weighted_sum in self._weighted_sums.items():
+            total_weight = self._weights.get(metric_name, 0.0)
+            finalized[metric_name] = 0.0 if total_weight <= 0.0 else float(weighted_sum / total_weight)
+        return finalized
 
 
 def _infer_hidden_size(backbone_config) -> int:
@@ -174,7 +221,8 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
 
     def update(self, batch) -> UpdateResult:
         torch, _, _, _ = require_hf_dependencies()
-        metric_history: Dict[str, List[float]] = {} # 这个metric_history字典每次附加上去的是每个 microbatch 的指标值，最后在整个 update 结束后会对这些指标值进行平均
+        update_metrics = _MetricAccumulator()
+        optimizer_step_metrics: List[Dict[str, float]] = []
         self.model.train()
 
         for _ in range(self.actor_config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
@@ -182,18 +230,22 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                 microbatches = tuple(self._iter_microbatches(minibatch, self.actor_config.micro_batch_size))
                 if not microbatches:
                     continue
-
+                
+                # 如果是per_token 的 loss_agg_mode，那么在_compute_policy_loss中计算的损失是micro_batch 上面每个 token 的平均损失，因此为了实现梯度累积这里每一个 micro_batch 的 loss 权重就是这个 micro_batch 中所有 response_mask 中有效 token 的总数。
+                # 如果是seq-mean-token-mean，那么这里一个 microbatch 的权重是其包含的样本数
                 microbatch_weights: List[float] = [
                     max(get_loss_weight(microbatch, self.actor_config.loss_agg_mode), 1.0) for microbatch in microbatches
-                ] # 如果是per_token 的 loss_agg_mode，那么在_compute_policy_loss中计算的损失是micro_batch 上面每个 token 的平均损失，因此为了实现梯度累积这里每一个 micro_batch 的 loss 权重就是这个 micro_batch 中所有 response_mask 中有效 token 的总数。
+                ] 
                 total_weight = sum(microbatch_weights)
+                step_metrics_accumulator = _MetricAccumulator()
 
                 self.optimizer.zero_grad() # 在对一个 mini-batch 的所有 micro-batch 进行反向传播之前，先将优化器的梯度缓存清零，以避免梯度累积到之前的 mini-batch 中。
                 for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据 PPO 的损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
+                    token_weight = float(count_valid_tokens(microbatch.batch["response_mask"]))
                     current_log_probs, current_entropy = self._compute_response_log_probs_and_entropy(
                         self.model,
                         microbatch,
-                        compute_entropy=self.actor_config.entropy_coeff != 0.0,
+                        compute_entropy=self.actor_config.record_entropy or self.actor_config.entropy_coeff != 0.0,
                     )
                     field_names = ["old_log_probs", "advantages"]
                     if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
@@ -210,13 +262,15 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                         clip_ratio_c=self.actor_config.clip_ratio_c,
                         loss_agg_mode=self.actor_config.loss_agg_mode,
                     )
+                    entropy_bonus = None
                     if current_entropy is not None:
                         entropy_bonus = masked_mean(current_entropy, training_tensors["response_mask"])
-                        total_loss = policy_loss - (self.actor_config.entropy_coeff * entropy_bonus)
+
+                    total_loss = policy_loss
+                    if self.actor_config.entropy_coeff != 0.0 and entropy_bonus is not None:
+                        total_loss = total_loss - (self.actor_config.entropy_coeff * entropy_bonus)
+                    if self.actor_config.record_entropy and entropy_bonus is not None:
                         step_metrics["policy_entropy"] = float(entropy_bonus.detach().cpu())
-                    else:
-                        total_loss = policy_loss
-                        step_metrics["policy_entropy"] = 0.0
 
                     if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
                         kl_penalty = compute_kl_penalty(
@@ -231,18 +285,27 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                     scaled_loss = total_loss * (microbatch_weight / max(total_weight, 1.0))
                     scaled_loss.backward()
                     step_metrics["actor_loss"] = float(total_loss.detach().cpu())
-                    for metric_name, metric_value in step_metrics.items():
-                        metric_history.setdefault(metric_name, []).append(float(metric_value))
+                    step_metrics_accumulator.add_many(
+                        step_metrics,
+                        loss_weight=microbatch_weight,
+                        token_weight=token_weight,
+                    )
+                    update_metrics.add_many(
+                        step_metrics,
+                        loss_weight=microbatch_weight,
+                        token_weight=token_weight,
+                    )
 
                 if self.actor_config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.actor_config.max_grad_norm)
                 self.optimizer.step() # 对一个mini-batch的所有 micro-batch 进行反向传播并累积梯度后，进行一次优化器步骤来更新模型参数。是显存增加最多的地方，例如 8k->16K
+                optimizer_step_metrics.append(step_metrics_accumulator.finalize())
 
         self.update_steps += 1 # 实际上这里更新了ppo_epochs*len(batch)/ppo_mini_batch_size 次，但我们把它当做一次整体的策略更新。
         self.model.eval()
-        averaged_metrics = {name: average_or_zero(values) for name, values in metric_history.items()}
+        averaged_metrics = update_metrics.finalize()
         averaged_metrics["actor_update_steps"] = float(self.update_steps)
-        return UpdateResult(metrics=averaged_metrics)
+        return UpdateResult(metrics=averaged_metrics, step_metrics=optimizer_step_metrics)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -308,7 +371,8 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
 
     def update(self, batch) -> UpdateResult:
         torch, _, _, _ = require_hf_dependencies()
-        metric_history: Dict[str, List[float]] = {}
+        update_metrics = _MetricAccumulator()
+        optimizer_step_metrics: List[Dict[str, float]] = []
         self.backbone.train()
         self.value_head.train()
 
@@ -323,9 +387,11 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
                     max(get_loss_weight(microbatch, self.value_config.loss_agg_mode), 1.0) for microbatch in microbatches
                 ]
                 total_weight = sum(microbatch_weights)
+                step_metrics_accumulator = _MetricAccumulator()
 
                 self.optimizer.zero_grad()
                 for microbatch, microbatch_weight in zip(microbatches, microbatch_weights):
+                    token_weight = float(count_valid_tokens(microbatch.batch["response_mask"]))
                     predicted_values = self._compute_response_values(microbatch)
                     training_tensors = build_training_tensors(microbatch, self.device, field_names=("returns",))
                     value_loss, step_metrics = compute_value_loss(
@@ -338,8 +404,16 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
                     scaled_loss = value_loss * (microbatch_weight / max(total_weight, 1.0))
                     scaled_loss.backward()
                     step_metrics["critic_loss"] = float(value_loss.detach().cpu())
-                    for metric_name, metric_value in step_metrics.items():
-                        metric_history.setdefault(metric_name, []).append(float(metric_value))
+                    step_metrics_accumulator.add_many(
+                        step_metrics,
+                        loss_weight=microbatch_weight,
+                        token_weight=token_weight,
+                    )
+                    update_metrics.add_many(
+                        step_metrics,
+                        loss_weight=microbatch_weight,
+                        token_weight=token_weight,
+                    )
 
                 if self.value_config.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -347,13 +421,14 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
                         self.value_config.max_grad_norm,
                     )
                 self.optimizer.step()
+                optimizer_step_metrics.append(step_metrics_accumulator.finalize())
 
         self.update_steps += 1
         self.backbone.eval()
         self.value_head.eval()
-        averaged_metrics = {name: average_or_zero(values) for name, values in metric_history.items()}
+        averaged_metrics = update_metrics.finalize()
         averaged_metrics["critic_update_steps"] = float(self.update_steps)
-        return UpdateResult(metrics=averaged_metrics)
+        return UpdateResult(metrics=averaged_metrics, step_metrics=optimizer_step_metrics)
 
     def state_dict(self) -> Dict[str, Any]:
         return {

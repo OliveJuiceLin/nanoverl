@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,17 @@ except ImportError:  # pragma: no cover - default in this workspace
 
 def _write_jsonl(path: Path, rows):
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+
+class _RecordingTracker:
+    def __init__(self):
+        self.events = []
+
+    def log(self, data, step):
+        self.events.append((step, dict(data)))
+
+    def close(self):
+        return
 
 
 @unittest.skipUnless(HF_TEST_DEPS, "HF backend tests require torch, transformers, and tokenizers.")
@@ -178,6 +190,17 @@ class HFBackendTest(unittest.TestCase):
             },
         )
 
+    def _attach_policy_training_fields(self, batch: RLBatch, old_log_probs, advantages, ref_log_probs=None) -> RLBatch:
+        batch.batch["old_log_probs"] = old_log_probs
+        batch.batch["advantages"] = advantages
+        if ref_log_probs is not None:
+            batch.batch["ref_log_probs"] = ref_log_probs
+        return batch
+
+    def _attach_value_training_fields(self, batch: RLBatch, returns) -> RLBatch:
+        batch.batch["returns"] = returns
+        return batch
+
     def test_manual_batch_contract_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             model_dir = self._make_model_dir(Path(tmpdir))
@@ -276,6 +299,186 @@ class HFBackendTest(unittest.TestCase):
             self.assertEqual(len(values.values), 2)
             self.assertEqual(len(values.values[0]), len(batch.batch["responses"][0]))
 
+    def test_policy_entropy_recording_is_decoupled_from_entropy_loss(self):
+        cases = [
+            {"entropy_coeff": 0.0, "record_entropy": False, "expected_compute_entropy": False, "expect_metric": False},
+            {"entropy_coeff": 0.0, "record_entropy": True, "expected_compute_entropy": True, "expect_metric": True},
+            {"entropy_coeff": 0.1, "record_entropy": False, "expected_compute_entropy": True, "expect_metric": False},
+            {"entropy_coeff": 0.1, "record_entropy": True, "expected_compute_entropy": True, "expect_metric": True},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = self._make_model_dir(Path(tmpdir))
+            tokenizer = load_tokenizer(
+                TrainerConfig.from_dict({"model": {"path": str(model_dir), "tokenizer_path": str(model_dir)}}).model
+            )
+            batch = self._attach_policy_training_fields(
+                self._make_batch(tokenizer, ["say yes", "say no"], ["yes", "no"]),
+                old_log_probs=[[0.0], [0.0]],
+                advantages=[[1.0], [1.0]],
+            )
+
+            for case in cases:
+                with self.subTest(case=case):
+                    config = TrainerConfig.from_dict(
+                        {
+                            "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                            "rollout": {"backend": "hf", "response_length": 4},
+                            "actor": {
+                                "backend": "hf",
+                                "device": "cpu",
+                                "ppo_mini_batch_size": 2,
+                                "micro_batch_size": 1,
+                                "ppo_epochs": 1,
+                                "entropy_coeff": case["entropy_coeff"],
+                                "record_entropy": case["record_entropy"],
+                            },
+                            "critic": {"enable": False},
+                            "reference": {"enable": False},
+                        }
+                    )
+                    policy_worker = HFPolicyWorker(config.model, config.actor)
+                    compute_entropy_flags = []
+
+                    def fake_compute(_model, microbatch, compute_entropy=False):
+                        del microbatch
+                        compute_entropy_flags.append(bool(compute_entropy))
+                        log_probs = torch.zeros((1, 1), dtype=torch.float32, device=policy_worker.device, requires_grad=True)
+                        entropy = None
+                        if compute_entropy:
+                            entropy = torch.full(
+                                (1, 1),
+                                0.5,
+                                dtype=torch.float32,
+                                device=policy_worker.device,
+                                requires_grad=True,
+                            )
+                        return log_probs, entropy
+
+                    policy_worker._compute_response_log_probs_and_entropy = fake_compute
+                    result = policy_worker.update(batch)
+                    self.assertEqual(compute_entropy_flags, [case["expected_compute_entropy"], case["expected_compute_entropy"]])
+                    self.assertEqual("policy_entropy" in result.metrics, case["expect_metric"])
+
+    def test_policy_update_metrics_use_weighted_microbatch_aggregation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = self._make_model_dir(Path(tmpdir))
+            config = TrainerConfig.from_dict(
+                {
+                    "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                    "rollout": {"backend": "hf", "response_length": 4},
+                    "actor": {
+                        "backend": "hf",
+                        "device": "cpu",
+                        "ppo_mini_batch_size": 2,
+                        "micro_batch_size": 1,
+                        "ppo_epochs": 1,
+                        "clip_ratio": 0.2,
+                        "entropy_coeff": 0.0,
+                        "record_entropy": True,
+                    },
+                    "critic": {"enable": False},
+                    "reference": {"enable": False},
+                }
+            )
+            tokenizer = load_tokenizer(config.model)
+            batch = self._attach_policy_training_fields(
+                self._make_batch(tokenizer, ["say yes", "what is two plus two ?"], ["yes", "answer four yes"]),
+                old_log_probs=[[0.0], [0.0, 0.0, 0.0]],
+                advantages=[[1.0], [1.0, 1.0, 1.0]],
+            )
+            policy_worker = HFPolicyWorker(config.model, config.actor)
+
+            def fake_compute(_model, microbatch, compute_entropy=False):
+                self.assertTrue(compute_entropy)
+                response_length = len(microbatch.batch["responses"][0])
+                if response_length == 1:
+                    log_probs = torch.tensor(
+                        [[math.log(2.0)]],
+                        dtype=torch.float32,
+                        device=policy_worker.device,
+                        requires_grad=True,
+                    )
+                    entropy = torch.tensor(
+                        [[10.0]],
+                        dtype=torch.float32,
+                        device=policy_worker.device,
+                        requires_grad=True,
+                    )
+                else:
+                    log_probs = torch.tensor(
+                        [[0.0, 0.0, 0.0]],
+                        dtype=torch.float32,
+                        device=policy_worker.device,
+                        requires_grad=True,
+                    )
+                    entropy = torch.tensor(
+                        [[1.0, 1.0, 1.0]],
+                        dtype=torch.float32,
+                        device=policy_worker.device,
+                        requires_grad=True,
+                    )
+                return log_probs, entropy
+
+            policy_worker._compute_response_log_probs_and_entropy = fake_compute
+            result = policy_worker.update(batch)
+            self.assertAlmostEqual(result.metrics["policy_entropy"], 3.25, places=6)
+            self.assertAlmostEqual(result.metrics["policy_clipfrac"], 0.25, places=6)
+            self.assertAlmostEqual(result.metrics["policy_clipfrac_lower"], 0.0, places=6)
+            self.assertAlmostEqual(result.metrics["policy_approx_kl"], -math.log(2.0) / 4.0, places=6)
+            self.assertAlmostEqual(result.metrics["actor_loss"], -1.05, places=6)
+            self.assertEqual(len(result.step_metrics), 1)
+            self.assertAlmostEqual(result.step_metrics[0]["policy_entropy"], 3.25, places=6)
+
+    def test_value_update_metrics_use_weighted_microbatch_aggregation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = self._make_model_dir(Path(tmpdir))
+            config = TrainerConfig.from_dict(
+                {
+                    "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                    "rollout": {"backend": "hf", "response_length": 4},
+                    "actor": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "critic": {
+                        "backend": "hf",
+                        "device": "cpu",
+                        "enable": True,
+                        "ppo_mini_batch_size": 2,
+                        "micro_batch_size": 1,
+                        "ppo_epochs": 1,
+                        "cliprange_value": 0.5,
+                    },
+                    "reference": {"enable": False},
+                }
+            )
+            tokenizer = load_tokenizer(config.model)
+            batch = self._attach_value_training_fields(
+                self._make_batch(tokenizer, ["say yes", "what is two plus two ?"], ["yes", "answer four yes"]),
+                returns=[[10.0], [1.0, 1.0, 1.0]],
+            )
+            value_worker = HFValueWorker(config.model, config.critic)
+
+            def fake_values(microbatch):
+                response_length = len(microbatch.batch["responses"][0])
+                if response_length == 1:
+                    return torch.tensor(
+                        [[0.0]],
+                        dtype=torch.float32,
+                        device=value_worker.device,
+                        requires_grad=True,
+                    )
+                return torch.tensor(
+                    [[0.0, 0.0, 0.0]],
+                    dtype=torch.float32,
+                    device=value_worker.device,
+                    requires_grad=True,
+                )
+
+            value_worker._compute_response_values = fake_values
+            result = value_worker.update(batch)
+            self.assertAlmostEqual(result.metrics["value_abs_error"], 3.25, places=6)
+            self.assertAlmostEqual(result.metrics["critic_loss"], 25.75, places=6)
+            self.assertEqual(len(result.step_metrics), 1)
+            self.assertAlmostEqual(result.step_metrics[0]["value_abs_error"], 3.25, places=6)
+
     def test_rollout_sync_changes_log_probs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -352,6 +555,89 @@ class HFBackendTest(unittest.TestCase):
                     resumed_trainer.train_loader.state_dict()["sampler"]["position"],
                     saved_loader_state["sampler"]["position"],
                 )
+            finally:
+                resumed_trainer.close()
+
+    def test_trainer_can_log_optimizer_steps_and_resume_log_counters(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            model_dir = self._make_model_dir(root)
+            dataset_path = root / "train.jsonl"
+            checkpoint_dir = root / "checkpoints"
+            _write_jsonl(
+                dataset_path,
+                [
+                    {"prompt": "say yes", "expected_response": "yes", "data_source": "qa"},
+                    {"prompt": "what is two plus two ?", "expected_response": "four", "data_source": "math"},
+                ],
+            )
+            config = TrainerConfig.from_dict(
+                {
+                    "data": {
+                        "train_path": str(dataset_path),
+                        "val_path": str(dataset_path),
+                        "train_batch_size": 2,
+                        "val_batch_size": 2,
+                        "shuffle": False,
+                    },
+                    "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                    "actor": {
+                        "backend": "hf",
+                        "device": "cpu",
+                        "ppo_mini_batch_size": 1,
+                        "micro_batch_size": 1,
+                        "ppo_epochs": 1,
+                    },
+                    "critic": {
+                        "backend": "hf",
+                        "device": "cpu",
+                        "enable": True,
+                        "ppo_mini_batch_size": 1,
+                        "micro_batch_size": 1,
+                        "ppo_epochs": 1,
+                    },
+                    "reference": {"backend": "hf", "device": "cpu", "enable": True},
+                    "rollout": {
+                        "backend": "hf",
+                        "device": "cpu",
+                        "response_length": 4,
+                        "train": {"do_sample": False, "n": 1, "temperature": 0.0},
+                        "validation": {"do_sample": False, "n": 1, "temperature": 0.0},
+                    },
+                    "trainer": {
+                        "total_training_steps": 1,
+                        "validate_before_train": False,
+                        "test_freq": 0,
+                        "save_freq": 1,
+                        "default_local_dir": str(checkpoint_dir),
+                        "loggers": [],
+                        "log_optimizer_steps": True,
+                    },
+                }
+            )
+            trainer = build_trainer(config)
+            recorder = _RecordingTracker()
+            trainer.tracker = recorder
+            try:
+                trainer.fit()
+                self.assertEqual([step for step, _ in recorder.events], [0, 1, 2, 3, 4])
+                self.assertEqual(recorder.events[0][1]["critic/optimizer_step"], 1.0)
+                self.assertEqual(recorder.events[1][1]["critic/optimizer_step"], 2.0)
+                self.assertEqual(recorder.events[2][1]["actor/optimizer_step"], 1.0)
+                self.assertEqual(recorder.events[3][1]["actor/optimizer_step"], 2.0)
+                self.assertIn("actor/actor_loss", recorder.events[4][1])
+                saved_log_step = trainer.log_step
+                saved_actor_optimizer_step = trainer.actor_optimizer_step
+                saved_critic_optimizer_step = trainer.critic_optimizer_step
+            finally:
+                trainer.close()
+
+            resumed_trainer = build_trainer(config)
+            try:
+                self.assertTrue(resumed_trainer.load_checkpoint())
+                self.assertEqual(resumed_trainer.log_step, saved_log_step)
+                self.assertEqual(resumed_trainer.actor_optimizer_step, saved_actor_optimizer_step)
+                self.assertEqual(resumed_trainer.critic_optimizer_step, saved_critic_optimizer_step)
             finally:
                 resumed_trainer.close()
 

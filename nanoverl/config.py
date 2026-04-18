@@ -125,6 +125,7 @@ class ActorConfig:
     clip_ratio_high: Optional[float] = None
     clip_ratio_c: float = 3.0
     entropy_coeff: float = 0.0
+    record_entropy: bool = False
     use_kl_loss: bool = False
     kl_loss_coef: float = 0.001
     loss_agg_mode: str = "token-mean"
@@ -203,6 +204,7 @@ class TrainerRuntimeConfig:
     project_name: str = "nanoverl"
     experiment_name: str = "debug"
     default_local_dir: str = "checkpoints"
+    log_optimizer_steps: bool = False
     loggers: Tuple[str, ...] = ("console",)
 
 

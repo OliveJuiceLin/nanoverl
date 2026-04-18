@@ -150,10 +150,43 @@ class RLTrainer:
         self.artifact_writer = artifact_writer
         self.runtime = runtime or TorchDistributedRuntime()
         self.global_step = 0
+        self.log_step = 0
+        self.actor_optimizer_step = 0
+        self.critic_optimizer_step = 0
         self.last_validation_metrics: Dict[str, float] = {}
 
     def close(self) -> None:
         self.tracker.close()
+
+    def _log_metrics(self, metrics: Dict[str, float]) -> None:
+        self.tracker.log(metrics, step=self.log_step)
+        self.log_step += 1
+
+    def _record_optimizer_step_metrics(
+        self,
+        prefix: str,
+        step_metrics: list[Dict[str, float]],
+    ) -> None:
+        """
+        处理强化学习中“全局步数”与“实际优化器更新步数”的记录问题
+        Rollout 生成一次数据（即 1 个 Global Step）
+        针对这一批数据进行多次组装（Mini-batches）和多次循环（Epochs），这意味着在一个 Global Step 内，优化器（Optimizer）实际上会更新很多次
+        """
+        counter_attr = "%s_optimizer_step" % prefix
+        for metrics in step_metrics: # 代表着针对同一批数据的不同 Mini-batch 和 Epoch 的优化器更新指标
+            next_optimizer_step = int(getattr(self, counter_attr)) + 1
+            setattr(self, counter_attr, next_optimizer_step)
+            if not self.config.trainer.log_optimizer_steps:
+                # 检查配置中是否允许记录如此细粒度（Optimizer Step 级别）的日志。如果不允许，则跳过后面的日志组装和发送（仅保持内部计数）。
+                continue
+            log_data = {
+                "%s/%s" % (prefix, key): value
+                for key, value in metrics.items()
+            }
+            log_data["%s/optimizer_step" % prefix] = float(next_optimizer_step)
+            log_data["training/global_step"] = float(self.global_step + 1)
+            log_data["training/epoch"] = float(self.train_loader.epoch)
+            self._log_metrics(log_data)
 
     def _uses_critic(self) -> bool:
         # This method is new in Phase 2 so PPO and GRPO can share one trainer loop
@@ -348,6 +381,9 @@ class RLTrainer:
     def _checkpoint_payload(self) -> Dict[str, object]:
         return {
             "global_step": self.global_step,
+            "log_step": self.log_step,
+            "actor_optimizer_step": self.actor_optimizer_step,
+            "critic_optimizer_step": self.critic_optimizer_step,
             "train_loader_state": self.train_loader.state_dict(),
             "policy_state": self.policy_worker.state_dict(),
             "reference_state": self.reference_worker.state_dict() if self.reference_worker is not None else None,
@@ -366,6 +402,9 @@ class RLTrainer:
         if payload is None:
             return False
         self.global_step = int(payload["global_step"])
+        self.log_step = int(payload.get("log_step", self.global_step))
+        self.actor_optimizer_step = int(payload.get("actor_optimizer_step", 0))
+        self.critic_optimizer_step = int(payload.get("critic_optimizer_step", 0))
         self.train_loader.load_state_dict(payload["train_loader_state"])
         self.policy_worker.load_state_dict(payload["policy_state"])
         if self.reference_worker is not None and payload.get("reference_state") is not None:
@@ -373,7 +412,7 @@ class RLTrainer:
         if self.value_worker is not None and payload.get("value_state") is not None:
             self.value_worker.load_state_dict(payload["value_state"])
         self.rollout_engine.load_state_dict(payload.get("rollout_state", {}))
-        self.rollout_engine.sync_policy(self.policy_worker.state_dict())
+        self.rollout_engine.sync_policy(self.policy_worker.state_dict()) # TODO: 这里的同步有些多余，因为在调用这个函数的外部本身就会执行一次同步
         return True
 
     def validate(self) -> Dict[str, float]:
@@ -493,6 +532,7 @@ class RLTrainer:
             t0 = time.time()
             critic_update = self.value_worker.update(rollout_batch)  # type: ignore[union-attr]
             metrics.update({"critic/%s" % key: value for key, value in critic_update.metrics.items()})
+            self._record_optimizer_step_metrics("critic", critic_update.step_metrics)
             timing["critic_update"] = time.time() - t0
         # 如果全局步骤数已经超过了 critic_warmup 的设置，则更新策略，并将相关指标添加到 metrics 中，以便进行日志记录和分析。同时，将更新后的策略状态同步到 rollout_engine 中，以确保在后续的 rollout 过程中使用最新的策略进行生成。
         # 在 critic_warmup 阶段，训练过程只更新价值函数，而不更新策略。这是为了让价值函数先行学习一个相对稳定的状态值估计，从而在后续的策略更新中提供更准确的优势估计，帮助策略更有效地学习。
@@ -500,6 +540,7 @@ class RLTrainer:
             t0 = time.time()
             actor_update = self.policy_worker.update(rollout_batch) # 会更新self.config.ppo_epochs次
             metrics.update({"actor/%s" % key: value for key, value in actor_update.metrics.items()})
+            self._record_optimizer_step_metrics("actor", actor_update.step_metrics)
             self.rollout_engine.sync_policy(self.policy_worker.state_dict()) # 更新结束后同步策略到 rollout_engine 中，以确保在后续的 rollout 过程中使用最新的策略进行生成。
             timing["actor_update"] = time.time() - t0
 
@@ -519,7 +560,7 @@ class RLTrainer:
                 world_size=self.runtime.world_size,
             )
         )
-        metrics["training/global_step"] = float(self.global_step)
+        metrics["training/global_step"] = float(self.global_step + 1)
         metrics["training/epoch"] = float(self.train_loader.epoch)
         self._maybe_dump_train_preview(rollout_batch, self.global_step + 1)
         return metrics
@@ -531,7 +572,7 @@ class RLTrainer:
         if self.config.trainer.validate_before_train:
             val_metrics = self.validate()
             if val_metrics:
-                self.tracker.log(val_metrics, step=self.global_step)
+                self._log_metrics(val_metrics)
             if self.config.trainer.validate_only:
                 return val_metrics
 
@@ -551,7 +592,7 @@ class RLTrainer:
                 if self.global_step % self.config.trainer.test_freq == 0 or self.global_step == max_steps:
                     metrics.update(self.validate()) # 来自验证过程的指标
 
-            self.tracker.log(metrics, step=self.global_step) # 来自训练过程和验证过程的指标都会被记录到 tracker 中，以便后续的分析和可视化。
+            self._log_metrics(metrics) # 来自训练过程和验证过程的指标都会被记录到 tracker 中，以便后续的分析和可视化。
 
             # 根据配置中的 save_freq 设置，定期保存训练检查点。当全局步骤数达到指定的保存频率时，调用 save_checkpoint 方法将当前的训练状态保存到磁盘
             if self.config.trainer.save_freq > 0:

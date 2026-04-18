@@ -24,6 +24,7 @@ class ValueResult:
 @dataclass
 class UpdateResult:
     metrics: Dict[str, float] = field(default_factory=dict)
+    step_metrics: List[Dict[str, float]] = field(default_factory=list)
 
 
 class PolicyWorker:
