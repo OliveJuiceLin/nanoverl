@@ -14,7 +14,17 @@ class ConfigError(ValueError):
     """Raised when a config file or config tree is invalid."""
 
 
+_BUILTIN_ALGORITHM_DEFAULTS: Dict[str, Tuple[str, str]] = {
+    "ppo": ("gae", "ppo_clip"),
+    "grpo": ("grpo", "ppo_clip"),
+    "rloo": ("rloo", "reinforce"),
+}
+_ACTOR_ONLY_ALGORITHMS = {"grpo", "rloo"}
+_GROUPED_ROLLOUT_ALGORITHMS = {"grpo", "rloo"}
+
+
 def _load_mapping(path: Path) -> Dict[str, Any]:
+    """负责读取文件，根据后缀名（.json 或 .yaml/.yml）使用相应的库将其解析为一个普通的 Python 字典 (dict)"""
     suffix = path.suffix.lower()
     text = path.read_text(encoding="utf-8")
     if suffix == ".json":
@@ -39,6 +49,7 @@ T = TypeVar("T")
 
 
 def _coerce_dataclass(cls: Type[T], value: Any) -> T:
+    """ 负责将一个普通的 Python 字典（或其他映射类型）转换为一个特定的 dataclass 实例。它会递归地处理嵌套的 dataclass 字段，并且支持一些常见的类型提示（如 Tuple 和 Optional）。如果输入已经是目标 dataclass 的实例，或者输入为 None（在这种情况下会使用默认值），它也能正确处理。"""
     if isinstance(value, cls):
         return value
     if value is None:
@@ -104,6 +115,7 @@ class SamplingConfig:
 
 @dataclass
 class AlgorithmConfig:
+    name: Optional[str] = None
     advantage_estimator: str = "gae"
     gamma: float = 1.0
     lam: float = 1.0
@@ -117,6 +129,7 @@ class AlgorithmConfig:
 class ActorConfig:
     backend: str = "debug"
     device: Optional[str] = None
+    policy_loss: str = "ppo_clip"
     ppo_mini_batch_size: int = 2
     ppo_epochs: int = 1
     micro_batch_size: Optional[int] = None
@@ -260,6 +273,27 @@ class TrainerConfig:
 
     def _apply_derived_defaults(self) -> None:
         """它在配置对象实例化后，负责自动补全那些“取决于其他配置项”的默认值，以保证配置组合的合理性与一致性"""
+        self.algorithm.advantage_estimator = str(self.algorithm.advantage_estimator).lower()
+        algorithm_name_was_set = self.algorithm.name is not None
+        if self.algorithm.name is None:
+            self.algorithm.name = (
+                self.algorithm.advantage_estimator
+                if self.algorithm.advantage_estimator in _GROUPED_ROLLOUT_ALGORITHMS
+                else "ppo"
+            )
+        else:
+            self.algorithm.name = str(self.algorithm.name).lower()
+        self.actor.policy_loss = str(self.actor.policy_loss).lower()
+        algorithm_defaults = _BUILTIN_ALGORITHM_DEFAULTS.get(self.algorithm.name)
+        if algorithm_defaults is not None:
+            if algorithm_name_was_set and self.algorithm.advantage_estimator not in {"gae", algorithm_defaults[0]}:
+                raise ConfigError(
+                    "algorithm.name='%s' requires algorithm.advantage_estimator='%s'."
+                    % (self.algorithm.name, algorithm_defaults[0])
+                )
+            self.algorithm.advantage_estimator = algorithm_defaults[0]
+            if self.actor.policy_loss == "ppo_clip":
+                self.actor.policy_loss = algorithm_defaults[1]
         if self.rollout.backend in {"hf", "vllm"} and self.model.tokenizer_path is None:
             self.model.tokenizer_path = self.model.path
         if self.trainer.validate_only:
@@ -276,8 +310,8 @@ class TrainerConfig:
             raise ConfigError("data.max_prompt_length must be positive.")
         if self.data.max_response_length <= 0:
             raise ConfigError("data.max_response_length must be positive.")
-        if self.algorithm.advantage_estimator not in {"gae", "grpo"}:
-            raise ConfigError("algorithm.advantage_estimator must be either 'gae' or 'grpo'.")
+        if not self.algorithm.name:
+            raise ConfigError("algorithm.name must not be empty.")
         if self.rollout.train.n <= 0:
             raise ConfigError("rollout.train.n must be positive.")
         if self.rollout.validation.n <= 0:
@@ -304,7 +338,7 @@ class TrainerConfig:
             raise ConfigError("actor.ppo_mini_batch_size must be positive.")
         if self.actor.micro_batch_size is not None and self.actor.micro_batch_size <= 0:
             raise ConfigError("actor.micro_batch_size must be positive when set.")
-        uses_critic = self.critic.enable and self.algorithm.advantage_estimator != "grpo"
+        uses_critic = self.critic.enable and self.algorithm.name not in _ACTOR_ONLY_ALGORITHMS
         if self.actor.micro_batch_size is not None:
             if self.actor.micro_batch_size > self.actor.ppo_mini_batch_size:
                 raise ConfigError("actor.micro_batch_size must not exceed actor.ppo_mini_batch_size.")
@@ -319,12 +353,24 @@ class TrainerConfig:
                 raise ConfigError("critic.micro_batch_size must not exceed critic.ppo_mini_batch_size.")
             if self.critic.ppo_mini_batch_size % self.critic.micro_batch_size != 0:
                 raise ConfigError("critic.ppo_mini_batch_size must be divisible by critic.micro_batch_size.")
-        if self.algorithm.advantage_estimator == "grpo" and self.rollout.train.n < 2:
-            raise ConfigError("GRPO requires rollout.train.n >= 2.")
-        if self.algorithm.advantage_estimator == "grpo" and self.actor.ppo_mini_batch_size % self.rollout.train.n != 0:
-            raise ConfigError("GRPO requires actor.ppo_mini_batch_size to be divisible by rollout.train.n.")
-        if self.algorithm.advantage_estimator == "grpo" and self.actor.ppo_mini_batch_size < self.rollout.train.n:
-            raise ConfigError("GRPO requires actor.ppo_mini_batch_size to cover at least one rollout group.")
+        if self.algorithm.name in _GROUPED_ROLLOUT_ALGORITHMS and self.rollout.train.n < 2:
+            raise ConfigError("%s requires rollout.train.n >= 2." % self.algorithm.name.upper())
+        if (
+            self.algorithm.name in _GROUPED_ROLLOUT_ALGORITHMS
+            and self.actor.ppo_mini_batch_size % self.rollout.train.n != 0
+        ):
+            raise ConfigError(
+                "%s requires actor.ppo_mini_batch_size to be divisible by rollout.train.n."
+                % self.algorithm.name.upper()
+            )
+        if (
+            self.algorithm.name in _GROUPED_ROLLOUT_ALGORITHMS
+            and self.actor.ppo_mini_batch_size < self.rollout.train.n
+        ):
+            raise ConfigError(
+                "%s requires actor.ppo_mini_batch_size to cover at least one rollout group."
+                % self.algorithm.name.upper()
+            )
         if self.algorithm.use_kl_in_reward and not self.reference.enable:
             raise ConfigError("Reference worker must be enabled when KL-in-reward is enabled.")
         if self.actor.use_kl_loss and not self.reference.enable:

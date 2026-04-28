@@ -6,7 +6,7 @@ import random
 from typing import Any, Dict, List, Optional
 
 from nanoverl.algos.kl import compute_kl_penalty
-from nanoverl.algos.ppo import compute_policy_loss, compute_value_loss, masked_mean
+from nanoverl.algos.ppo import compute_value_loss, get_policy_loss_fn, masked_mean
 from nanoverl.backends.hf import (
     batch_lists_to_tensor,
     build_training_tensors,
@@ -237,7 +237,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                     max(get_loss_weight(microbatch, self.actor_config.loss_agg_mode), 1.0) for microbatch in microbatches
                 ] 
                 total_weight = sum(microbatch_weights)
-                step_metrics_accumulator = _MetricAccumulator()
+                step_metrics_accumulator = _MetricAccumulator() # 在每一个 optimizer.step 维度上的记录
 
                 self.optimizer.zero_grad() # 在对一个 mini-batch 的所有 micro-batch 进行反向传播之前，先将优化器的梯度缓存清零，以避免梯度累积到之前的 mini-batch 中。
                 for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据 PPO 的损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
@@ -251,7 +251,8 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                     if self.actor_config.use_kl_loss and "ref_log_probs" in microbatch.batch:
                         field_names.append("ref_log_probs")
                     training_tensors = build_training_tensors(microbatch, self.device, field_names=field_names)
-                    policy_loss, step_metrics = compute_policy_loss(
+                    policy_loss_fn = get_policy_loss_fn(self.actor_config.policy_loss)
+                    policy_loss, step_metrics = policy_loss_fn(
                         old_log_probs=training_tensors["old_log_probs"],
                         log_probs=current_log_probs,
                         advantages=training_tensors["advantages"],

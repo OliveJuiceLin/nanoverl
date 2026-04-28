@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Dict, List
 
 from nanoverl.algos.kl import compute_kl_penalty
-from nanoverl.algos.ppo import compute_policy_loss, compute_value_loss
+from nanoverl.algos.ppo import compute_value_loss, get_policy_loss_fn
 from nanoverl.core.batch import RLBatch
 from nanoverl.workers.base import LogProbResult, PolicyWorker, ReferenceWorker, UpdateResult, ValueResult, ValueWorker
 
@@ -30,7 +30,8 @@ class DebugPolicyWorker(PolicyWorker):
             [value + self.config.update_step_size if keep else value for value, keep in zip(row, mask_row)]
             for row, mask_row in zip(old_log_probs, batch.batch["response_mask"])
         ]
-        loss, metrics = compute_policy_loss(
+        policy_loss_fn = get_policy_loss_fn(self.config.policy_loss)
+        loss, metrics = policy_loss_fn(
             old_log_probs=old_log_probs,
             log_probs=shifted_log_probs,
             advantages=batch.batch["advantages"],

@@ -1,12 +1,34 @@
-"""Advantage estimators used by PPO- and GRPO-like trainers."""
+"""Advantage estimators used by built-in RL algorithms."""
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 
 Matrix = Sequence[Sequence[float]]
+AdvantageEstimatorFn = Callable[[Any, Any], Tuple[List[List[float]], List[List[float]]]]
+_ADVANTAGE_ESTIMATOR_REGISTRY: Dict[str, AdvantageEstimatorFn] = {}
+
+
+def register_advantage_estimator(name: str) -> Callable[[AdvantageEstimatorFn], AdvantageEstimatorFn]:
+    def decorator(fn: AdvantageEstimatorFn) -> AdvantageEstimatorFn:
+        if name in _ADVANTAGE_ESTIMATOR_REGISTRY and _ADVANTAGE_ESTIMATOR_REGISTRY[name] is not fn:
+            raise ValueError("Advantage estimator already registered: %s" % name)
+        _ADVANTAGE_ESTIMATOR_REGISTRY[name] = fn
+        return fn
+
+    return decorator
+
+
+def get_advantage_estimator(name: str) -> AdvantageEstimatorFn:
+    try:
+        return _ADVANTAGE_ESTIMATOR_REGISTRY[name]
+    except KeyError as exc:
+        raise ValueError(
+            "Unsupported advantage estimator: %s. Available estimators: %s"
+            % (name, sorted(_ADVANTAGE_ESTIMATOR_REGISTRY))
+        ) from exc
 
 
 def _zeros_like(matrix: Matrix) -> List[List[float]]:
@@ -75,4 +97,75 @@ def compute_grpo_advantages(
     return advantages, returns
 
 
-__all__ = ["compute_gae_advantages", "compute_grpo_advantages"]
+def compute_rloo_advantages(
+    token_level_rewards: Matrix,
+    response_mask: Sequence[Sequence[int]],
+    group_ids: Sequence[str],
+) -> Tuple[List[List[float]], List[List[float]]]:
+    """Leave-one-out outcome advantages for grouped rollouts."""
+
+    sequence_scores = []
+    for rewards_row, mask_row in zip(token_level_rewards, response_mask):
+        sequence_scores.append(sum(value for value, mask in zip(rewards_row, mask_row) if mask))
+
+    grouped_indices: Dict[str, List[int]] = {}
+    for row_index, group_id in enumerate(group_ids):
+        grouped_indices.setdefault(group_id, []).append(row_index)
+
+    advantages = _zeros_like(token_level_rewards)
+    returns = _zeros_like(token_level_rewards)
+    for group_id, indices in grouped_indices.items():
+        if len(indices) < 2:
+            raise ValueError("RLOO requires at least two responses per group: %s" % group_id)
+        group_total = sum(sequence_scores[index] for index in indices)
+        for row_index in indices:
+            score = sequence_scores[row_index]
+            baseline = (group_total - score) / (len(indices) - 1)
+            advantage = score - baseline
+            for token_index, mask in enumerate(response_mask[row_index]):
+                if mask:
+                    advantages[row_index][token_index] = advantage
+                    returns[row_index][token_index] = advantage
+    return advantages, returns
+
+
+@register_advantage_estimator("gae")
+def estimate_gae_advantages(batch: Any, algorithm_config: Any) -> Tuple[List[List[float]], List[List[float]]]:
+    return compute_gae_advantages(
+        token_level_rewards=batch.batch["token_level_rewards"],
+        values=batch.batch["values"],
+        response_mask=batch.batch["response_mask"],
+        gamma=algorithm_config.gamma,
+        lam=algorithm_config.lam,
+    )
+
+
+@register_advantage_estimator("grpo")
+def estimate_grpo_advantages(batch: Any, algorithm_config: Any) -> Tuple[List[List[float]], List[List[float]]]:
+    return compute_grpo_advantages(
+        token_level_rewards=batch.batch["token_level_rewards"],
+        response_mask=batch.batch["response_mask"],
+        group_ids=batch.non_tensor["uid"],
+        normalize_by_std=algorithm_config.norm_adv_by_std_in_grpo,
+    )
+
+
+@register_advantage_estimator("rloo")
+def estimate_rloo_advantages(batch: Any, algorithm_config: Any) -> Tuple[List[List[float]], List[List[float]]]:
+    return compute_rloo_advantages(
+        token_level_rewards=batch.batch["token_level_rewards"],
+        response_mask=batch.batch["response_mask"],
+        group_ids=batch.non_tensor["uid"],
+    )
+
+
+__all__ = [
+    "compute_gae_advantages",
+    "compute_grpo_advantages",
+    "compute_rloo_advantages",
+    "estimate_gae_advantages",
+    "estimate_grpo_advantages",
+    "estimate_rloo_advantages",
+    "get_advantage_estimator",
+    "register_advantage_estimator",
+]

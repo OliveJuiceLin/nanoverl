@@ -3,10 +3,31 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 Matrix = Sequence[Sequence[float]]
+PolicyLossFn = Callable[..., Tuple[float, Dict[str, float]]]
+_POLICY_LOSS_REGISTRY: Dict[str, PolicyLossFn] = {}
+
+
+def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
+    def decorator(fn: PolicyLossFn) -> PolicyLossFn:
+        if name in _POLICY_LOSS_REGISTRY and _POLICY_LOSS_REGISTRY[name] is not fn:
+            raise ValueError("Policy loss already registered: %s" % name)
+        _POLICY_LOSS_REGISTRY[name] = fn
+        return fn
+
+    return decorator
+
+
+def get_policy_loss_fn(name: str) -> PolicyLossFn:
+    try:
+        return _POLICY_LOSS_REGISTRY[name]
+    except KeyError as exc:
+        raise ValueError(
+            "Unsupported policy loss: %s. Available losses: %s" % (name, sorted(_POLICY_LOSS_REGISTRY))
+        ) from exc
 
 
 def _is_tensor_like(value: Any) -> bool:
@@ -90,6 +111,7 @@ def aggregate_loss(
     raise ValueError("Unsupported loss_agg_mode: %s" % loss_agg_mode)
 
 
+@register_policy_loss("ppo_clip")
 def compute_policy_loss(
     old_log_probs: Matrix,
     log_probs: Matrix,
@@ -167,6 +189,44 @@ def compute_policy_loss(
     return loss, metrics
 
 
+@register_policy_loss("reinforce")
+def compute_reinforce_policy_loss(
+    old_log_probs: Matrix,
+    log_probs: Matrix,
+    advantages: Matrix,
+    response_mask: Sequence[Sequence[int]],
+    cliprange: float = 0.0,
+    cliprange_low: Optional[float] = None,
+    cliprange_high: Optional[float] = None,
+    clip_ratio_c: float = 3.0,
+    loss_agg_mode: str = "token-mean",
+    loss_scale_factor: Optional[int] = None,
+) -> Tuple[float, Dict[str, float]]:
+    if _is_tensor_like(log_probs):
+        loss_matrix = -log_probs * advantages
+        approx_kl = masked_mean(-(log_probs - old_log_probs), response_mask)
+        loss = aggregate_loss(loss_matrix, response_mask, loss_agg_mode, loss_scale_factor)
+        return loss, {"policy_approx_kl": float(approx_kl.detach().cpu())}
+
+    loss_matrix: List[List[float]] = []
+    approx_kl_matrix: List[List[float]] = []
+    for old_row, new_row, adv_row, mask_row in zip(old_log_probs, log_probs, advantages, response_mask):
+        loss_row: List[float] = []
+        kl_row: List[float] = []
+        for old_log_prob, log_prob, advantage, keep in zip(old_row, new_row, adv_row, mask_row):
+            if not keep:
+                loss_row.append(0.0)
+                kl_row.append(0.0)
+                continue
+            loss_row.append(-log_prob * advantage)
+            kl_row.append(-(log_prob - old_log_prob))
+        loss_matrix.append(loss_row)
+        approx_kl_matrix.append(kl_row)
+
+    loss = aggregate_loss(loss_matrix, response_mask, loss_agg_mode, loss_scale_factor)
+    return loss, {"policy_approx_kl": masked_mean(approx_kl_matrix, response_mask)}
+
+
 def compute_value_loss(
     values: Matrix,
     returns: Matrix,
@@ -202,4 +262,12 @@ def compute_value_loss(
     return loss, {"value_abs_error": mean_abs_error}
 
 
-__all__ = ["aggregate_loss", "compute_policy_loss", "compute_value_loss", "masked_mean"]
+__all__ = [
+    "aggregate_loss",
+    "compute_policy_loss",
+    "compute_reinforce_policy_loss",
+    "compute_value_loss",
+    "get_policy_loss_fn",
+    "masked_mean",
+    "register_policy_loss",
+]

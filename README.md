@@ -8,7 +8,7 @@ It is inspired by `verl`, but it deliberately keeps a much smaller surface area:
 
 - one clear synchronous trainer loop
 - explicit policy / reference / value / rollout boundaries
-- enough engineering for real PPO / GRPO experiments
+- enough engineering for real PPO / GRPO / RLOO experiments
 - fewer layers that get in the way of reading and modifying the code
 
 This repository is not trying to be a feature-complete replacement for `verl`.
@@ -19,7 +19,7 @@ Its goal is to be a clean RL core that is easy to understand, easy to modify, an
 The current repository should be understood like this:
 
 - The formal mainline is still a Phase 1 style synchronous RL core.
-- Some Phase 2 usability work is already present, such as GRPO support, validation summaries, and lightweight debug artifacts.
+- Some Phase 2 usability work is already present, such as algorithm plugins, GRPO / RLOO support, validation summaries, and lightweight debug artifacts.
 - There are already a few thin Phase 3 backend slices, especially single-node FSDP and local `vllm` rollout integration.
 - Not every exposed option should be read as a mature production feature. Some parts are intentionally thin and kept as future extension points.
 
@@ -29,7 +29,7 @@ Today, the most trustworthy path is still:
 - stateful dataset / dataloader
 - synchronous trainer
 - explicit policy / reference / value workers
-- rollout -> reward -> advantage -> update
+- algorithm-selected rollout -> reward -> advantage -> update semantics
 - checkpoint / validation / logging on the same main loop
 
 ## Repo Map
@@ -37,7 +37,7 @@ Today, the most trustworthy path is still:
 The repository is organized around the RL training path.
 
 - `nanoverl/algos`
-  - Core RL math helpers such as PPO losses, KL penalties, and advantage estimators.
+  - Algorithm plugins plus shared RL math such as policy losses, KL penalties, and advantage estimators.
 - `nanoverl/backends`
   - Thin backend-specific utilities for Hugging Face, `vllm`, and training backends such as FSDP.
 - `nanoverl/checkpoint`
@@ -67,19 +67,12 @@ The repository is organized around the RL training path.
 
 ## How Training Works
 
-The current trainer owns the whole RL step explicitly.
+The trainer owns the lifecycle and the selected algorithm owns the RL step semantics.
 
 1. Load a batch from the stateful train loader.
-2. Expand prompts for grouped sampling when needed.
-3. Run rollout to produce responses.
-4. Compute reward outputs from prompt + response.
-5. Recompute old policy log-probs.
-6. Compute reference log-probs and value estimates when enabled.
-7. Build token-level rewards and advantages.
-8. Update critic first when the critic is active.
-9. Update actor.
-10. Sync the rollout engine with the latest policy weights.
-11. Log metrics, run validation, and save checkpoints on the same driver-owned path.
+2. Dispatch the batch to the configured `algorithm.name` plugin.
+3. The algorithm prepares rollout batches, computes rewards, log-probs, values when needed, advantages, and worker updates.
+4. The trainer logs metrics, runs validation, and saves checkpoints on the same driver-owned path.
 
 This ordering is the main thing `nanoverl` tries to preserve and keep readable.
 
@@ -95,6 +88,10 @@ The repository currently has these meaningful paths:
   - The first serious multi-GPU training slice.
 - local HF or FSDP training workers + local `vllm` rollout
   - A thin rollout backend extension that reuses the same trainer loop.
+- built-in algorithm plugins
+  - `ppo`: critic-backed GAE with clipped PPO policy loss.
+  - `grpo`: actor-only grouped rollout with GRPO advantages and PPO-style clipped policy loss.
+  - `rloo`: actor-only grouped rollout with leave-one-out advantages and REINFORCE policy loss.
 
 ## Not Yet Supported
 
@@ -112,7 +109,7 @@ These should be treated as intentionally missing, intentionally thin, or future 
 The current roadmap can be summarized as:
 
 1. Keep the synchronous RL core small and correct.
-2. Make PPO / GRPO research work comfortable on top of the same core contracts.
+2. Make PPO / GRPO / RLOO research work comfortable on top of the same core contracts.
 3. Add backend breadth only when it materially expands research coverage.
 4. Avoid reintroducing `verl`-style complexity unless it clearly pays for itself.
 
@@ -129,6 +126,12 @@ Debug PPO:
 
 ```bash
 python3 -m nanoverl.cli.train_rl --config examples/configs/debug_ppo.json
+```
+
+Debug RLOO:
+
+```bash
+python3 -m nanoverl.cli.train_rl --config examples/configs/debug_rloo.json
 ```
 
 Local HF PPO:
