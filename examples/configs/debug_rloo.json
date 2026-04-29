@@ -11,32 +11,21 @@
     "path": "debug-model"
   },
   "algorithm": {
-    "advantage_estimator": "gae",
-    "gamma": 1.0,
-    "lam": 1.0,
-    "use_kl_in_reward": true,
-    "kl_penalty": "low_var_kl",
-    "kl_coef": 0.01
+    "name": "rloo"
   },
   "actor": {
     "backend": "debug",
     "mini_batch_size": 2,
     "update_epochs": 1,
-    "clip_ratio": 0.2,
-    "use_kl_loss": false,
     "update_step_size": 0.02
   },
   "critic": {
     "backend": "debug",
-    "enable": true,
-    "mini_batch_size": 2,
-    "update_epochs": 1,
-    "cliprange_value": 0.5
+    "enable": false
   },
   "reference": {
     "backend": "debug",
-    "enable": true,
-    "fixed_kl_offset": -0.1
+    "enable": false
   },
   "rollout": {
     "backend": "debug",
@@ -46,7 +35,7 @@
       "top_p": 1.0,
       "top_k": -1,
       "do_sample": true,
-      "n": 1
+      "n": 2
     },
     "validation": {
       "temperature": 0.0,
@@ -61,18 +50,15 @@
     "function_name": "compute_reward"
   },
   "trainer": {
-    "total_epochs": 2,
+    "total_epochs": 1,
     "validate_before_train": true,
-    "validate_only": false,
     "test_freq": 1,
-    "save_freq": 1,
-    "critic_warmup": 0,
+    "save_freq": 0,
     "project_name": "nanoverl",
-    "experiment_name": "debug_ppo",
-    "default_local_dir": "checkpoints/debug_ppo",
+    "experiment_name": "debug_rloo",
+    "default_local_dir": "checkpoints/debug_rloo",
     "loggers": [
-      "console",
-      "file"
+      "console"
     ]
   }
 }

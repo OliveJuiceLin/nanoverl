@@ -15,10 +15,18 @@ from nanoverl.data.dataset import JsonDataset, StatefulDataLoader
 from nanoverl.distributed import TorchDistributedRuntime
 from nanoverl.logging.trackers import TrackingManager
 from nanoverl.reward import RewardManager, load_reward_function
-from nanoverl.rollout import DebugRolloutEngine, HFRolloutEngine, SamplingParams, VLLMRolloutEngine
+from nanoverl.rollout import (
+    PolicySyncResult,
+    PolicySyncer,
+    SamplingParams,
+    create_rollout_engine,
+)
 from nanoverl.trainer.artifacts import ArtifactWriter, build_batch_preview_rows
 from nanoverl.trainer.validation import summarize_validation
 from nanoverl.workers import create_policy_worker, create_reference_worker, create_value_worker
+
+
+CHECKPOINT_VERSION = 2
 
 
 def build_trainer(config: TrainerConfig) -> "RLTrainer":
@@ -70,14 +78,7 @@ def build_trainer(config: TrainerConfig) -> "RLTrainer":
     use_critic = config.critic.enable and algorithm.uses_critic(config)
     value_worker = create_value_worker(config.critic.backend, config.model, config.critic) if use_critic else None
 
-    if config.rollout.backend == "debug":
-        rollout_engine = DebugRolloutEngine(max_response_length=config.rollout.response_length)
-    elif config.rollout.backend == "hf":
-        rollout_engine = HFRolloutEngine(config.model, config.data, config.rollout)
-    elif config.rollout.backend == "vllm":
-        rollout_engine = VLLMRolloutEngine(config.model, config.data, config.rollout)
-    else:
-        raise ValueError("Unknown rollout backend: %s" % config.rollout.backend)
+    rollout_engine = create_rollout_engine(config.rollout.backend, config.model, config.data, config.rollout)
     # ========== 构建奖励函数管理器、日志跟踪器和检查点管理器 ==========
     reward_fn = load_reward_function(config.reward.function_path, config.reward.function_name)
     reward_manager = RewardManager(reward_fn)
@@ -141,6 +142,7 @@ class RLTrainer:
         self.artifact_writer = artifact_writer
         self.runtime = runtime or TorchDistributedRuntime()
         self.algorithm = algorithm
+        self.policy_syncer = PolicySyncer()
         self.global_step = 0
         self.log_step = 0
         self.actor_optimizer_step = 0
@@ -216,25 +218,25 @@ class RLTrainer:
     def _balance_rollout_batch(self, batch: RLBatch) -> RLBatch:
         """
         Function:
-            在强化学习微调中（尤其是 GRPO 或 n > 1 的 PPO），模型生成的回复长短不一。如果按原始顺序直接把数据切成 mini-batch 送给 Actor 进行训练，极易出现显存碎片化或负载不均：
+            在强化学习微调中（尤其是 GRPO/RLOO 或 n > 1 的 grouped sampling），模型生成的回复长短不一。如果按原始顺序直接把数据切成 mini-batch 送给 Actor 进行训练，极易出现显存碎片化或负载不均：
             某个 mini-batch 凑巧全是长序列，导致 GPU 显存溢出（OOM）。某个 mini-batch 全是短序列，导致 GPU 算力闲置。
             该函数的作用是在进入打分和训练阶段前，计算每条数据的真实 Token 长度，将它们重新排列。它在保证同一个 prompt 的多个预测版本（同 UID）不被打散的前提下，让切分后的各个 mini-batch 在总长度（Workload）上尽可能平均。
         Note:
-            - 当 rollout 次数 n 大于设定的 ppo_mini_batch_size 时，该平衡逻辑和实际截断切分会产生机制上的矛盾（桶多组少）。
-            - 建议配置上多注意 ppo_mini_batch_size 大于或等于 n。
+            - 当 rollout 次数 n 大于设定的 mini_batch_size 时，该平衡逻辑和实际截断切分会产生机制上的矛盾（桶多组少）。
+            - 建议配置上多注意 mini_batch_size 大于或等于 n。
         """
-        
+
         # 如果配置中关闭了平衡 (balance_batch=False)，
         # 或者整个 batch 的大小还不如一个 mini-batch 大，
         # 或者缺少长度计算所需的键值，则直接原样返回。
         if not self.config.trainer.balance_batch:
             return batch
-        if len(batch) <= self.config.actor.ppo_mini_batch_size:
+        if len(batch) <= self.config.actor.mini_batch_size:
             return batch
         if "prompts" not in batch.batch or "response_mask" not in batch.batch:
             return batch
 
-        target_partition_rows = max(1, self.config.actor.ppo_mini_batch_size) 
+        target_partition_rows = max(1, self.config.actor.mini_batch_size)
         grouped_indices: Dict[str, list[int]] = {}
         row_group_keys = batch.non_tensor.get("uid")
         if row_group_keys is None:
@@ -255,7 +257,7 @@ class RLTrainer:
             grouped_workloads.append((workload, row_indices))
 
         grouped_workloads.sort(key=lambda item: item[0], reverse=True) # 按照 workload 从大到小排序，优先处理那些工作量大的 prompt 组，以便更好地平衡后续 mini-batch 的负载。
-        partition_count = max(1, math.ceil(len(batch) / target_partition_rows)) # 
+        partition_count = max(1, math.ceil(len(batch) / target_partition_rows)) #
         partitions = [{"rows": 0, "workload": 0, "indices": []} for _ in range(partition_count)]
 
         for workload, row_indices in grouped_workloads: # 为每一组找一个合适的 partition 来放置它
@@ -308,17 +310,28 @@ class RLTrainer:
 
     def _checkpoint_payload(self) -> Dict[str, object]:
         return {
-            "global_step": self.global_step,
-            "log_step": self.log_step,
-            "actor_optimizer_step": self.actor_optimizer_step,
-            "critic_optimizer_step": self.critic_optimizer_step,
-            "train_loader_state": self.train_loader.state_dict(),
-            "policy_state": self.policy_worker.state_dict(),
-            "reference_state": self.reference_worker.state_dict() if self.reference_worker is not None else None,
-            "value_state": self.value_worker.state_dict() if self.value_worker is not None else None,
+            "checkpoint_version": CHECKPOINT_VERSION,
+            "trainer_state": {
+                "global_step": self.global_step,
+                "log_step": self.log_step,
+                "actor_optimizer_step": self.actor_optimizer_step,
+                "critic_optimizer_step": self.critic_optimizer_step,
+            },
+            "loader_state": {
+                "train": self.train_loader.state_dict(),
+                "validation": self.val_loader.state_dict() if self.val_loader is not None else None,
+            },
+            "worker_state": {
+                "policy": self.policy_worker.state_dict(),
+                "reference": self.reference_worker.state_dict() if self.reference_worker is not None else None,
+                "value": self.value_worker.state_dict() if self.value_worker is not None else None,
+            },
             "rollout_state": self.rollout_engine.state_dict(),
             "config": self.config.to_dict(),
         }
+
+    def _sync_rollout_policy(self, reason: str) -> PolicySyncResult:
+        return self.policy_syncer.sync(self.policy_worker, self.rollout_engine, reason)
 
     def save_checkpoint(self) -> None:
         if self.runtime.is_main_process:
@@ -329,18 +342,27 @@ class RLTrainer:
         payload = self.checkpoint_manager.load_latest() # load(checkpoint_dir) | none
         if payload is None:
             return False
-        self.global_step = int(payload["global_step"])
-        self.log_step = int(payload.get("log_step", self.global_step))
-        self.actor_optimizer_step = int(payload.get("actor_optimizer_step", 0))
-        self.critic_optimizer_step = int(payload.get("critic_optimizer_step", 0))
-        self.train_loader.load_state_dict(payload["train_loader_state"])
-        self.policy_worker.load_state_dict(payload["policy_state"])
-        if self.reference_worker is not None and payload.get("reference_state") is not None:
-            self.reference_worker.load_state_dict(payload["reference_state"])
-        if self.value_worker is not None and payload.get("value_state") is not None:
-            self.value_worker.load_state_dict(payload["value_state"])
-        self.rollout_engine.load_state_dict(payload.get("rollout_state", {}))
-        self.rollout_engine.sync_policy(self.policy_worker.state_dict()) # TODO: 这里的同步有些多余，因为在调用这个函数的外部本身就会执行一次同步
+        if payload.get("checkpoint_version") != CHECKPOINT_VERSION:
+            raise ValueError("Unsupported checkpoint payload version: %s" % payload.get("checkpoint_version"))
+
+        trainer_state = payload["trainer_state"]
+        loader_state = payload["loader_state"]
+        worker_state = payload["worker_state"]
+
+        self.global_step = int(trainer_state["global_step"])
+        self.log_step = int(trainer_state["log_step"])
+        self.actor_optimizer_step = int(trainer_state["actor_optimizer_step"])
+        self.critic_optimizer_step = int(trainer_state["critic_optimizer_step"])
+        self.train_loader.load_state_dict(loader_state["train"])
+        if self.val_loader is not None and loader_state.get("validation") is not None:
+            self.val_loader.load_state_dict(loader_state["validation"])
+        self.policy_worker.load_state_dict(worker_state["policy"])
+        if self.reference_worker is not None and worker_state.get("reference") is not None:
+            self.reference_worker.load_state_dict(worker_state["reference"])
+        if self.value_worker is not None and worker_state.get("value") is not None:
+            self.value_worker.load_state_dict(worker_state["value"])
+        self.rollout_engine.load_state_dict(payload["rollout_state"])
+        self._sync_rollout_policy("resume")
         return True
 
     def validate(self) -> Dict[str, float]:
@@ -411,12 +433,14 @@ class RLTrainer:
             balance_rollout_batch=self._balance_rollout_batch,
             record_optimizer_step_metrics=self._record_optimizer_step_metrics,
             dump_train_preview=self._maybe_dump_train_preview,
+            sync_rollout_policy=self._sync_rollout_policy,
         )
         return self.algorithm.run_step(batch, context)
 
     def fit(self) -> Dict[str, float]:
-        self.load_checkpoint()
-        self.rollout_engine.sync_policy(self.policy_worker.state_dict())
+        resumed = self.load_checkpoint()
+        if not resumed:
+            self._sync_rollout_policy("startup")
 
         if self.config.trainer.validate_before_train:
             val_metrics = self.validate()
@@ -453,4 +477,4 @@ class RLTrainer:
         return self.last_validation_metrics
 
 
-__all__ = ["RLTrainer", "build_trainer"]
+__all__ = ["CHECKPOINT_VERSION", "RLTrainer", "build_trainer"]

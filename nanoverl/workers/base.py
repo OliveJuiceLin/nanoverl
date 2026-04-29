@@ -34,6 +34,9 @@ class PolicyWorker:
     def update(self, batch: RLBatch) -> UpdateResult:
         raise NotImplementedError
 
+    def policy_state_dict(self) -> Dict[str, Any]:
+        return {}
+
     def state_dict(self) -> Dict[str, Any]:
         return {}
 

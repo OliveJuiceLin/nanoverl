@@ -14,6 +14,7 @@ class DebugRolloutEngine(RolloutEngine):
     def __init__(self, max_response_length: int = 64):
         self.max_response_length = max_response_length
         self.policy_version = 0
+        self.policy_sync_steps = 0
 
     @staticmethod
     def _tokenize_text(text: str) -> List[int]:
@@ -84,12 +85,13 @@ class DebugRolloutEngine(RolloutEngine):
 
     def sync_policy(self, policy_state: Dict[str, Any]) -> None:
         self.policy_version = int(policy_state.get("version", self.policy_version))
+        self.policy_sync_steps += 1
 
     def state_dict(self) -> Dict[str, Any]:
-        return {"policy_version": self.policy_version}
+        return {"policy_sync_steps": self.policy_sync_steps}
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        self.policy_version = int(state.get("policy_version", 0))
+        self.policy_sync_steps = int(state.get("policy_sync_steps", 0))
 
 
 __all__ = ["DebugRolloutEngine"]

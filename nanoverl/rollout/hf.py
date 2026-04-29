@@ -6,7 +6,6 @@ from typing import Any, Dict, List
 
 from nanoverl.backends.hf import (
     batch_lists_to_tensor,
-    clone_model_state,
     encode_text,
     ensure_prompt_tokens,
     load_causal_lm,
@@ -113,14 +112,9 @@ class HFRolloutEngine(RolloutEngine):
         self.policy_sync_steps += 1
 
     def state_dict(self) -> Dict[str, Any]:
-        return {
-            "model_state": clone_model_state(self.model.state_dict()),
-            "policy_sync_steps": self.policy_sync_steps,
-        }
+        return {"policy_sync_steps": self.policy_sync_steps}
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        if state.get("model_state") is not None:
-            self.model.load_state_dict(state["model_state"])
         self.policy_sync_steps = int(state.get("policy_sync_steps", 0))
         self.model.to(self.device)
         self.model.eval()

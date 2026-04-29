@@ -113,7 +113,7 @@ class OnPolicyAlgorithm(RLAlgorithm):
             actor_update = context.policy_worker.update(rollout_batch)
             metrics.update({"actor/%s" % key: value for key, value in actor_update.metrics.items()})
             context.record_optimizer_step_metrics("actor", actor_update.step_metrics)
-            context.rollout_engine.sync_policy(context.policy_worker.state_dict())
+            metrics.update(context.sync_rollout_policy("actor_update").metrics)
             timing["actor_update"] = time.time() - t0
 
         timing["step"] = time.time() - step_started

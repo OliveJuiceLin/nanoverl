@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,24 +18,56 @@ def _write_jsonl(path: Path, rows) -> None:
 
 
 class ConfigValidationTest(unittest.TestCase):
-    def test_actor_micro_batch_must_divide_ppo_mini_batch(self):
+    def test_actor_micro_batch_must_divide_mini_batch(self):
         with self.assertRaises(ConfigError):
             TrainerConfig.from_dict(
                 {
                     "actor": {
                         "backend": "debug",
-                        "ppo_mini_batch_size": 3,
+                        "mini_batch_size": 3,
                         "micro_batch_size": 2,
                     }
                 }
             )
 
+    def test_old_ppo_update_fields_are_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "ppo_mini_batch_size"):
+            TrainerConfig.from_dict({"actor": {"ppo_mini_batch_size": 2}})
+        with self.assertRaisesRegex(ConfigError, "ppo_epochs"):
+            TrainerConfig.from_dict({"critic": {"ppo_epochs": 1}})
+
+    def test_ray_section_is_not_public_config(self):
+        with self.assertRaisesRegex(ConfigError, "ray"):
+            TrainerConfig.from_dict({"ray": {"enabled": False}})
+
+    def test_debug_rloo_config_is_not_gitignored(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        try:
+            result = subprocess.run(
+                ["git", "check-ignore", "examples/configs/debug_rloo.json"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            self.skipTest("git is not installed")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_example_configs_have_no_ray_section_and_parse(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        for path in sorted((repo_root / "examples" / "configs").glob("*.json")):
+            with self.subTest(path=path.name):
+                data = json.loads(path.read_text(encoding="utf-8"))
+                self.assertNotIn("ray", data)
+                TrainerConfig.from_dict(data)
+
     def test_balance_batch_requires_matching_actor_and_critic_minibatches(self):
         with self.assertRaises(ConfigError):
             TrainerConfig.from_dict(
                 {
-                    "actor": {"backend": "debug", "ppo_mini_batch_size": 4},
-                    "critic": {"backend": "debug", "enable": True, "ppo_mini_batch_size": 2},
+                    "actor": {"backend": "debug", "mini_batch_size": 4},
+                    "critic": {"backend": "debug", "enable": True, "mini_batch_size": 2},
                     "trainer": {"balance_batch": True},
                 }
             )
@@ -90,14 +123,14 @@ class TrainerPhase2Test(unittest.TestCase):
                 },
                 "actor": {
                     "backend": "debug",
-                    "ppo_mini_batch_size": 4,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 4,
+                    "update_epochs": 1,
                 },
                 "critic": {
                     "backend": "debug",
                     "enable": True,
-                    "ppo_mini_batch_size": 4,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 4,
+                    "update_epochs": 1,
                 },
                 "reference": {
                     "backend": "debug",
@@ -196,13 +229,13 @@ class TrainerPhase2Test(unittest.TestCase):
                     },
                     "actor": {
                         "backend": "debug",
-                        "ppo_mini_batch_size": 2,
-                        "ppo_epochs": 1,
+                        "mini_batch_size": 2,
+                        "update_epochs": 1,
                     },
                     "critic": {
                         "backend": "debug",
                         "enable": True,
-                        "ppo_mini_batch_size": 2,
+                        "mini_batch_size": 2,
                     },
                     "reference": {
                         "backend": "debug",
@@ -272,7 +305,7 @@ class TrainerPhase2Test(unittest.TestCase):
                         "function_path": str(reward_path),
                         "function_name": "compute_reward",
                     },
-                    "actor": {"backend": "debug", "ppo_mini_batch_size": 2},
+                    "actor": {"backend": "debug", "mini_batch_size": 2},
                     "critic": {"backend": "debug", "enable": False},
                     "reference": {"backend": "debug", "enable": False},
                     "rollout": {
@@ -332,7 +365,7 @@ class TrainerPhase2Test(unittest.TestCase):
                         "function_path": str(reward_path),
                         "function_name": "compute_reward",
                     },
-                    "actor": {"backend": "debug", "ppo_mini_batch_size": 2},
+                    "actor": {"backend": "debug", "mini_batch_size": 2},
                     "critic": {"backend": "debug", "enable": False},
                     "reference": {"backend": "debug", "enable": False},
                     "rollout": {

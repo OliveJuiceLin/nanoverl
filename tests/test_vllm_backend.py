@@ -10,6 +10,7 @@ from pathlib import Path
 from nanoverl.config import ConfigError, TrainerConfig
 from nanoverl.core.batch import RLBatch
 from nanoverl.rollout.base import SamplingParams
+from nanoverl.rollout.sync import PolicySyncer
 from nanoverl.trainer import build_trainer
 
 try:  # pragma: no cover - exercised only when optional deps are installed
@@ -141,8 +142,8 @@ class VLLMBackendTest(unittest.TestCase):
                 },
                 "actor": {
                     "backend": "hf",
-                    "ppo_mini_batch_size": 1,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 1,
+                    "update_epochs": 1,
                     "micro_batch_size": 1,
                     "clip_ratio": 0.2,
                     "lr": 1e-4,
@@ -186,7 +187,7 @@ class VLLMBackendTest(unittest.TestCase):
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
                     "data": {"max_prompt_length": 8},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 1},
+                    "actor": {"backend": "hf", "mini_batch_size": 1},
                     "critic": {"backend": "hf", "enable": False},
                     "reference": {"backend": "hf", "enable": False},
                     "rollout": {
@@ -223,7 +224,7 @@ class VLLMBackendTest(unittest.TestCase):
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
                     "data": {"max_prompt_length": 8},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 1, "lr": 1e-4},
+                    "actor": {"backend": "hf", "mini_batch_size": 1, "lr": 1e-4},
                     "critic": {"backend": "hf", "enable": False},
                     "reference": {"backend": "hf", "enable": False},
                     "rollout": {
@@ -242,7 +243,7 @@ class VLLMBackendTest(unittest.TestCase):
             with torch.no_grad():
                 for parameter in policy_worker.model.parameters():
                     parameter.add_(0.1)
-            rollout_engine.sync_policy(policy_worker.state_dict())
+            PolicySyncer().sync(policy_worker, rollout_engine, "test")
             self.assertGreater(rollout_engine.state_dict()["policy_sync_steps"], before_sync_steps)
 
     def test_hf_actor_vllm_rollout_fit_and_resume(self):

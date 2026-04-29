@@ -11,6 +11,7 @@ from pathlib import Path
 from nanoverl.config import TrainerConfig
 from nanoverl.core.batch import RLBatch
 from nanoverl.rollout.base import SamplingParams
+from nanoverl.rollout.sync import PolicySyncer
 from nanoverl.trainer import build_trainer
 
 try:  # pragma: no cover - exercised only when optional deps are installed
@@ -121,8 +122,8 @@ class HFBackendTest(unittest.TestCase):
                 },
                 "actor": {
                     "backend": "hf",
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 2,
+                    "update_epochs": 1,
                     "micro_batch_size": 1,
                     "clip_ratio": 0.2,
                     "lr": 1e-4,
@@ -131,8 +132,8 @@ class HFBackendTest(unittest.TestCase):
                 "critic": {
                     "backend": "hf",
                     "enable": True,
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 2,
+                    "update_epochs": 1,
                     "micro_batch_size": 1,
                     "cliprange_value": 0.5,
                     "lr": 1e-4,
@@ -222,7 +223,7 @@ class HFBackendTest(unittest.TestCase):
             config = TrainerConfig.from_dict(
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
-                    "actor": {"backend": "hf", "device": "cpu", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "actor": {"backend": "hf", "device": "cpu", "mini_batch_size": 2, "micro_batch_size": 1},
                     "critic": {"enable": False},
                     "reference": {"enable": False},
                     "rollout": {"backend": "hf", "response_length": 4},
@@ -254,7 +255,7 @@ class HFBackendTest(unittest.TestCase):
                         "chat_template_path": str(chat_template_path),
                     },
                     "data": {"max_prompt_length": 16},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 1},
+                    "actor": {"backend": "hf", "mini_batch_size": 1},
                     "critic": {"enable": False},
                     "reference": {"enable": False},
                     "rollout": {"backend": "hf", "response_length": 4, "device": "cpu"},
@@ -280,8 +281,8 @@ class HFBackendTest(unittest.TestCase):
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
                     "rollout": {"backend": "hf", "response_length": 4},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
-                    "critic": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "actor": {"backend": "hf", "mini_batch_size": 2, "micro_batch_size": 1},
+                    "critic": {"backend": "hf", "mini_batch_size": 2, "micro_batch_size": 1},
                     "reference": {"enable": False},
                 }
             )
@@ -326,9 +327,9 @@ class HFBackendTest(unittest.TestCase):
                             "actor": {
                                 "backend": "hf",
                                 "device": "cpu",
-                                "ppo_mini_batch_size": 2,
+                                "mini_batch_size": 2,
                                 "micro_batch_size": 1,
-                                "ppo_epochs": 1,
+                                "update_epochs": 1,
                                 "entropy_coeff": case["entropy_coeff"],
                                 "record_entropy": case["record_entropy"],
                             },
@@ -369,9 +370,9 @@ class HFBackendTest(unittest.TestCase):
                     "actor": {
                         "backend": "hf",
                         "device": "cpu",
-                        "ppo_mini_batch_size": 2,
+                        "mini_batch_size": 2,
                         "micro_batch_size": 1,
-                        "ppo_epochs": 1,
+                        "update_epochs": 1,
                         "clip_ratio": 0.2,
                         "entropy_coeff": 0.0,
                         "record_entropy": True,
@@ -436,14 +437,14 @@ class HFBackendTest(unittest.TestCase):
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
                     "rollout": {"backend": "hf", "response_length": 4},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "actor": {"backend": "hf", "mini_batch_size": 2, "micro_batch_size": 1},
                     "critic": {
                         "backend": "hf",
                         "device": "cpu",
                         "enable": True,
-                        "ppo_mini_batch_size": 2,
+                        "mini_batch_size": 2,
                         "micro_batch_size": 1,
-                        "ppo_epochs": 1,
+                        "update_epochs": 1,
                         "cliprange_value": 0.5,
                     },
                     "reference": {"enable": False},
@@ -487,7 +488,7 @@ class HFBackendTest(unittest.TestCase):
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
                     "data": {"max_prompt_length": 8},
-                    "actor": {"backend": "hf", "ppo_mini_batch_size": 1},
+                    "actor": {"backend": "hf", "mini_batch_size": 1},
                     "critic": {"enable": False},
                     "reference": {"enable": False},
                     "rollout": {"backend": "hf", "response_length": 4},
@@ -499,9 +500,32 @@ class HFBackendTest(unittest.TestCase):
             with torch.no_grad():
                 for parameter in policy_worker.model.parameters():
                     parameter.add_(0.25)
-            rollout.sync_policy(policy_worker.state_dict())
+            PolicySyncer().sync(policy_worker, rollout, "test")
             synced_rollout_parameter = next(rollout.model.parameters()).detach().clone()
             self.assertFalse(torch.equal(first_rollout_parameter, synced_rollout_parameter))
+            self.assertNotIn("model_state", rollout.state_dict())
+
+    def test_policy_export_state_excludes_optimizer_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = self._make_model_dir(Path(tmpdir))
+            config = TrainerConfig.from_dict(
+                {
+                    "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
+                    "actor": {"backend": "hf", "mini_batch_size": 1},
+                    "critic": {"enable": False},
+                    "reference": {"enable": False},
+                    "rollout": {"backend": "hf", "response_length": 4},
+                }
+            )
+            policy_worker = HFPolicyWorker(config.model, config.actor)
+            checkpoint_state = policy_worker.state_dict()
+            export_state = policy_worker.policy_state_dict()
+
+            self.assertIn("optimizer_state", checkpoint_state)
+            self.assertIn("update_steps", checkpoint_state)
+            self.assertIn("model_state", export_state)
+            self.assertNotIn("optimizer_state", export_state)
+            self.assertNotIn("update_steps", export_state)
 
     def test_local_hf_components_can_use_explicit_devices(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -509,8 +533,8 @@ class HFBackendTest(unittest.TestCase):
             config = TrainerConfig.from_dict(
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
-                    "actor": {"backend": "hf", "device": "cpu", "ppo_mini_batch_size": 1},
-                    "critic": {"backend": "hf", "device": "cpu", "enable": True, "ppo_mini_batch_size": 1},
+                    "actor": {"backend": "hf", "device": "cpu", "mini_batch_size": 1},
+                    "critic": {"backend": "hf", "device": "cpu", "enable": True, "mini_batch_size": 1},
                     "reference": {"backend": "hf", "device": "cpu", "enable": True},
                     "rollout": {"backend": "hf", "device": "cpu", "response_length": 4},
                 }
@@ -584,17 +608,17 @@ class HFBackendTest(unittest.TestCase):
                     "actor": {
                         "backend": "hf",
                         "device": "cpu",
-                        "ppo_mini_batch_size": 1,
+                        "mini_batch_size": 1,
                         "micro_batch_size": 1,
-                        "ppo_epochs": 1,
+                        "update_epochs": 1,
                     },
                     "critic": {
                         "backend": "hf",
                         "device": "cpu",
                         "enable": True,
-                        "ppo_mini_batch_size": 1,
+                        "mini_batch_size": 1,
                         "micro_batch_size": 1,
-                        "ppo_epochs": 1,
+                        "update_epochs": 1,
                     },
                     "reference": {"backend": "hf", "device": "cpu", "enable": True},
                     "rollout": {

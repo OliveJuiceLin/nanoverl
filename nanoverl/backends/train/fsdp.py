@@ -192,6 +192,9 @@ class FSDPPolicyWorker(FSDPWorkerMixin, HFPolicyWorker):
             "update_steps": self.update_steps,
         }
 
+    def policy_state_dict(self) -> Dict[str, Any]:
+        return {"model_state": self._module_state_dict(self.model)}
+
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         self._load_module_state_dict(self.model, state.get("model_state"))
         if state.get("optimizer_state") is not None:

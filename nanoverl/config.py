@@ -56,6 +56,12 @@ def _coerce_dataclass(cls: Type[T], value: Any) -> T:
         return cls()  # type: ignore[misc]
     if not isinstance(value, Mapping):
         raise ConfigError("Expected a mapping while building config dataclass.")
+    field_names = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
+    unknown_fields = sorted(set(value) - field_names)
+    if unknown_fields:
+        raise ConfigError(
+            "Unsupported config field(s) for %s: %s" % (cls.__name__, ", ".join(unknown_fields))
+        )
     type_hints = get_type_hints(cls)
     kwargs: Dict[str, Any] = {}
     for field_name, field_info in cls.__dataclass_fields__.items():  # type: ignore[attr-defined]
@@ -130,8 +136,8 @@ class ActorConfig:
     backend: str = "debug"
     device: Optional[str] = None
     policy_loss: str = "ppo_clip"
-    ppo_mini_batch_size: int = 2
-    ppo_epochs: int = 1
+    mini_batch_size: int = 2
+    update_epochs: int = 1
     micro_batch_size: Optional[int] = None
     clip_ratio: float = 0.2
     clip_ratio_low: Optional[float] = None
@@ -156,8 +162,8 @@ class CriticConfig:
     backend: str = "debug"
     device: Optional[str] = None
     enable: bool = True
-    ppo_mini_batch_size: int = 2
-    ppo_epochs: int = 1
+    mini_batch_size: int = 2
+    update_epochs: int = 1
     micro_batch_size: Optional[int] = None
     cliprange_value: float = 0.5
     loss_agg_mode: str = "token-mean"
@@ -222,13 +228,6 @@ class TrainerRuntimeConfig:
 
 
 @dataclass
-class RayConfig:
-    enabled: bool = False
-    address: Optional[str] = None
-    num_cpus: Optional[int] = None
-
-
-@dataclass
 class TrainerConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -239,10 +238,13 @@ class TrainerConfig:
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     trainer: TrainerRuntimeConfig = field(default_factory=TrainerRuntimeConfig)
-    ray: RayConfig = field(default_factory=RayConfig)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TrainerConfig":
+        allowed_sections = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
+        unknown_sections = sorted(set(data) - allowed_sections)
+        if unknown_sections:
+            raise ConfigError("Unsupported config section(s): %s" % ", ".join(unknown_sections))
         cfg = cls(
             data=_coerce_dataclass(DataConfig, data.get("data")),
             model=_coerce_dataclass(ModelConfig, data.get("model")),
@@ -253,7 +255,6 @@ class TrainerConfig:
             rollout=_coerce_dataclass(RolloutConfig, data.get("rollout")),
             reward=_coerce_dataclass(RewardConfig, data.get("reward")),
             trainer=_coerce_dataclass(TrainerRuntimeConfig, data.get("trainer")),
-            ray=_coerce_dataclass(RayConfig, data.get("ray")),
         )
         cfg._apply_derived_defaults()
         cfg.validate()
@@ -334,41 +335,41 @@ class TrainerConfig:
             raise ConfigError("trainer.validation_dump_freq must be non-negative.")
         if self.trainer.dump_max_rows <= 0:
             raise ConfigError("trainer.dump_max_rows must be positive.")
-        if self.actor.ppo_mini_batch_size <= 0:
-            raise ConfigError("actor.ppo_mini_batch_size must be positive.")
+        if self.actor.mini_batch_size <= 0:
+            raise ConfigError("actor.mini_batch_size must be positive.")
         if self.actor.micro_batch_size is not None and self.actor.micro_batch_size <= 0:
             raise ConfigError("actor.micro_batch_size must be positive when set.")
         uses_critic = self.critic.enable and self.algorithm.name not in _ACTOR_ONLY_ALGORITHMS
         if self.actor.micro_batch_size is not None:
-            if self.actor.micro_batch_size > self.actor.ppo_mini_batch_size:
-                raise ConfigError("actor.micro_batch_size must not exceed actor.ppo_mini_batch_size.")
-            if self.actor.ppo_mini_batch_size % self.actor.micro_batch_size != 0:
-                raise ConfigError("actor.ppo_mini_batch_size must be divisible by actor.micro_batch_size.")
-        if uses_critic and self.critic.ppo_mini_batch_size <= 0:
-            raise ConfigError("critic.ppo_mini_batch_size must be positive when critic is enabled.")
+            if self.actor.micro_batch_size > self.actor.mini_batch_size:
+                raise ConfigError("actor.micro_batch_size must not exceed actor.mini_batch_size.")
+            if self.actor.mini_batch_size % self.actor.micro_batch_size != 0:
+                raise ConfigError("actor.mini_batch_size must be divisible by actor.micro_batch_size.")
+        if uses_critic and self.critic.mini_batch_size <= 0:
+            raise ConfigError("critic.mini_batch_size must be positive when critic is enabled.")
         if uses_critic and self.critic.micro_batch_size is not None and self.critic.micro_batch_size <= 0:
             raise ConfigError("critic.micro_batch_size must be positive when set.")
         if uses_critic and self.critic.micro_batch_size is not None:
-            if self.critic.micro_batch_size > self.critic.ppo_mini_batch_size:
-                raise ConfigError("critic.micro_batch_size must not exceed critic.ppo_mini_batch_size.")
-            if self.critic.ppo_mini_batch_size % self.critic.micro_batch_size != 0:
-                raise ConfigError("critic.ppo_mini_batch_size must be divisible by critic.micro_batch_size.")
+            if self.critic.micro_batch_size > self.critic.mini_batch_size:
+                raise ConfigError("critic.micro_batch_size must not exceed critic.mini_batch_size.")
+            if self.critic.mini_batch_size % self.critic.micro_batch_size != 0:
+                raise ConfigError("critic.mini_batch_size must be divisible by critic.micro_batch_size.")
         if self.algorithm.name in _GROUPED_ROLLOUT_ALGORITHMS and self.rollout.train.n < 2:
             raise ConfigError("%s requires rollout.train.n >= 2." % self.algorithm.name.upper())
         if (
             self.algorithm.name in _GROUPED_ROLLOUT_ALGORITHMS
-            and self.actor.ppo_mini_batch_size % self.rollout.train.n != 0
+            and self.actor.mini_batch_size % self.rollout.train.n != 0
         ):
             raise ConfigError(
-                "%s requires actor.ppo_mini_batch_size to be divisible by rollout.train.n."
+                "%s requires actor.mini_batch_size to be divisible by rollout.train.n."
                 % self.algorithm.name.upper()
             )
         if (
             self.algorithm.name in _GROUPED_ROLLOUT_ALGORITHMS
-            and self.actor.ppo_mini_batch_size < self.rollout.train.n
+            and self.actor.mini_batch_size < self.rollout.train.n
         ):
             raise ConfigError(
-                "%s requires actor.ppo_mini_batch_size to cover at least one rollout group."
+                "%s requires actor.mini_batch_size to cover at least one rollout group."
                 % self.algorithm.name.upper()
             )
         if self.algorithm.use_kl_in_reward and not self.reference.enable:
@@ -406,14 +407,10 @@ class TrainerConfig:
             if self.rollout.tensor_model_parallel_size != 1:
                 raise ConfigError("rollout.tensor_model_parallel_size is currently supported only for value 1.")
         if self.trainer.balance_batch and uses_critic:
-            if self.actor.ppo_mini_batch_size != self.critic.ppo_mini_batch_size:
+            if self.actor.mini_batch_size != self.critic.mini_batch_size:
                 raise ConfigError(
                     "trainer.balance_batch currently requires actor and critic mini-batch sizes to match."
                 )
-        if self.ray.enabled and self.actor.backend == "debug":
-            # This is intentionally permissive; debug workers still run locally.
-            return
-
 
 __all__ = [
     "ActorConfig",
@@ -422,7 +419,6 @@ __all__ = [
     "CriticConfig",
     "DataConfig",
     "ModelConfig",
-    "RayConfig",
     "ReferenceConfig",
     "RewardConfig",
     "RolloutConfig",

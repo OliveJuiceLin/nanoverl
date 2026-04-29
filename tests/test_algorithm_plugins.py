@@ -38,7 +38,7 @@ class AlgorithmPluginTest(unittest.TestCase):
         grpo_config = TrainerConfig.from_dict(
             {
                 "algorithm": {"advantage_estimator": "grpo"},
-                "actor": {"ppo_mini_batch_size": 2},
+                "actor": {"mini_batch_size": 2},
                 "rollout": {"train": {"n": 2}},
             }
         )
@@ -64,8 +64,8 @@ class AlgorithmPluginTest(unittest.TestCase):
                         "shuffle": False,
                     },
                     "algorithm": {"name": "grpo"},
-                    "actor": {"backend": "debug", "ppo_mini_batch_size": 2},
-                    "critic": {"backend": "debug", "enable": True, "ppo_mini_batch_size": 2},
+                    "actor": {"backend": "debug", "mini_batch_size": 2},
+                    "critic": {"backend": "debug", "enable": True, "mini_batch_size": 2},
                     "reference": {"backend": "debug", "enable": True},
                     "rollout": {"backend": "debug", "train": {"n": 2}},
                     "trainer": {"loggers": [], "default_local_dir": tmpdir},
@@ -98,8 +98,8 @@ class AlgorithmPluginTest(unittest.TestCase):
                         "shuffle": False,
                     },
                     "algorithm": {"name": "rloo"},
-                    "actor": {"backend": "debug", "ppo_mini_batch_size": 2},
-                    "critic": {"backend": "debug", "enable": True, "ppo_mini_batch_size": 2},
+                    "actor": {"backend": "debug", "mini_batch_size": 2},
+                    "critic": {"backend": "debug", "enable": True, "mini_batch_size": 2},
                     "reference": {"backend": "debug", "enable": False},
                     "rollout": {"backend": "debug", "train": {"n": 2}},
                     "trainer": {

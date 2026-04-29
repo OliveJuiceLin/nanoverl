@@ -21,8 +21,8 @@
     },
     "actor": {
       "backend": "fsdp",
-      "ppo_mini_batch_size": 8,
-      "ppo_epochs": 1,
+      "mini_batch_size": 8,
+      "update_epochs": 1,
       "micro_batch_size": 1,
       "clip_ratio": 0.2,
       "use_kl_loss": true,

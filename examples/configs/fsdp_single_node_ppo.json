@@ -24,8 +24,8 @@
   },
   "actor": {
     "backend": "fsdp",
-    "ppo_mini_batch_size": 4,
-    "ppo_epochs": 1,
+    "mini_batch_size": 4,
+    "update_epochs": 1,
     "micro_batch_size": 1,
     "clip_ratio": 0.2,
     "lr": 1e-5,
@@ -35,8 +35,8 @@
   "critic": {
     "backend": "fsdp",
     "enable": true,
-    "ppo_mini_batch_size": 4,
-    "ppo_epochs": 1,
+    "mini_batch_size": 4,
+    "update_epochs": 1,
     "micro_batch_size": 1,
     "cliprange_value": 0.5,
     "lr": 1e-5,
@@ -82,8 +82,5 @@
     "loggers": [
       "console"
     ]
-  },
-  "ray": {
-    "enabled": false
   }
 }

@@ -208,7 +208,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
         self.model.eval()
         all_log_probs = []
         with self._no_grad():
-            for minibatch in self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, shuffle=False):
+            for minibatch in self._iter_minibatches(batch, self.actor_config.mini_batch_size, shuffle=False):
                 response_log_probs, _ = self._compute_response_log_probs_and_entropy(
                     self.model, minibatch, compute_entropy=False
                 ) # 这里会有显存的上升
@@ -225,8 +225,8 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
         optimizer_step_metrics: List[Dict[str, float]] = []
         self.model.train()
 
-        for _ in range(self.actor_config.ppo_epochs): # 这里的 epochs 表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
-            for minibatch in self._iter_minibatches(batch, self.actor_config.ppo_mini_batch_size, self.actor_config.shuffle): # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
+        for _ in range(self.actor_config.update_epochs): # 这里表示要重复利用同一批 rollout 数据进行多少轮策略优化更新。
+            for minibatch in self._iter_minibatches(batch, self.actor_config.mini_batch_size, self.actor_config.shuffle): # 每一轮都会将整个 batch 划分成多个 mini-batch，然后对每个 mini-batch 进行一次完整的前向和反向传播，最后更新模型参数。
                 microbatches = tuple(self._iter_microbatches(minibatch, self.actor_config.micro_batch_size))
                 if not microbatches:
                     continue
@@ -240,7 +240,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                 step_metrics_accumulator = _MetricAccumulator() # 在每一个 optimizer.step 维度上的记录
 
                 self.optimizer.zero_grad() # 在对一个 mini-batch 的所有 micro-batch 进行反向传播之前，先将优化器的梯度缓存清零，以避免梯度累积到之前的 mini-batch 中。
-                for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据 PPO 的损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
+                for microbatch, microbatch_weight in zip(microbatches, microbatch_weights): # 对于每个 mini-batch，我们进一步将其划分成多个 micro-batch，以便在内存受限的情况下进行训练。对于每个 micro-batch，我们计算当前策略的对数概率和熵值，然后根据配置选择的策略损失函数计算策略损失，并进行反向传播。最后，我们根据 micro-batch 的权重对损失进行缩放，以确保在更新模型参数时考虑到不同 micro-batch 的重要性。
                     token_weight = float(count_valid_tokens(microbatch.batch["response_mask"]))
                     current_log_probs, current_entropy = self._compute_response_log_probs_and_entropy(
                         self.model,
@@ -302,7 +302,7 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
                 self.optimizer.step() # 对一个mini-batch的所有 micro-batch 进行反向传播并累积梯度后，进行一次优化器步骤来更新模型参数。是显存增加最多的地方，例如 8k->16K
                 optimizer_step_metrics.append(step_metrics_accumulator.finalize())
 
-        self.update_steps += 1 # 实际上这里更新了ppo_epochs*len(batch)/ppo_mini_batch_size 次，但我们把它当做一次整体的策略更新。
+        self.update_steps += 1 # 实际上这里更新了update_epochs*len(batch)/mini_batch_size 次，但我们把它当做一次整体的策略更新。
         self.model.eval()
         averaged_metrics = update_metrics.finalize()
         averaged_metrics["actor_update_steps"] = float(self.update_steps)
@@ -314,6 +314,9 @@ class HFPolicyWorker(HFWorkerBase, PolicyWorker):
             "optimizer_state": self.optimizer.state_dict(),
             "update_steps": self.update_steps,
         }
+
+    def policy_state_dict(self) -> Dict[str, Any]:
+        return {"model_state": clone_model_state(self.model.state_dict())}
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         if state.get("model_state") is not None:
@@ -377,8 +380,8 @@ class HFValueWorker(HFWorkerBase, ValueWorker):
         self.backbone.train()
         self.value_head.train()
 
-        for _ in range(self.value_config.ppo_epochs):
-            minibatches = self._iter_minibatches(batch, self.value_config.ppo_mini_batch_size, self.value_config.shuffle)
+        for _ in range(self.value_config.update_epochs):
+            minibatches = self._iter_minibatches(batch, self.value_config.mini_batch_size, self.value_config.shuffle)
             for minibatch in minibatches:
                 microbatches = tuple(self._iter_microbatches(minibatch, self.value_config.micro_batch_size))
                 if not microbatches:

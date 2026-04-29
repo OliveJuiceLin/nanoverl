@@ -2,4 +2,9 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .vscode/
-examples/
+checkpoints/
+wandb/
+runs/
+outputs/
+*.log
+examples/data_preprocessed/

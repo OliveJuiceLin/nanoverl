@@ -57,6 +57,9 @@ class DebugPolicyWorker(PolicyWorker):
     def state_dict(self) -> Dict[str, float]:
         return {"version": float(self.version)}
 
+    def policy_state_dict(self) -> Dict[str, float]:
+        return {"version": float(self.version)}
+
     def load_state_dict(self, state: Dict[str, float]) -> None:
         self.version = int(state.get("version", 0))
 

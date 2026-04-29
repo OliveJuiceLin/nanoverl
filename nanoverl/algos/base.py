@@ -10,6 +10,7 @@ from nanoverl.core.batch import RLBatch
 from nanoverl.distributed import TorchDistributedRuntime
 from nanoverl.reward import RewardManager
 from nanoverl.rollout import RolloutEngine, SamplingParams
+from nanoverl.rollout.sync import PolicySyncResult
 
 
 def sampling_to_params(config: SamplingConfig) -> SamplingParams:
@@ -27,6 +28,10 @@ class OptimizerMetricRecorder(Protocol):
         ...
 
 
+def _noop_policy_sync(reason: str) -> PolicySyncResult:
+    return PolicySyncResult(reason=reason, count=0, seconds=0.0, metrics={})
+
+
 @dataclass
 class AlgorithmStepContext:
     config: TrainerConfig
@@ -42,6 +47,7 @@ class AlgorithmStepContext:
     balance_rollout_batch: Callable[[RLBatch], RLBatch]
     record_optimizer_step_metrics: OptimizerMetricRecorder
     dump_train_preview: Callable[[RLBatch, int], None]
+    sync_rollout_policy: Callable[[str], PolicySyncResult] = _noop_policy_sync
 
 
 class RLAlgorithm:

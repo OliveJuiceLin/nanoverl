@@ -3,14 +3,16 @@
 ### 问题 1: 关于构建逻辑与未定义键的处理
 
 *   **构建逻辑**: config.py  会先使用 config.py  将 `.json` 或 `.yaml` 文件读取为一个**普通的 Python 字典**。然后，它把这个字典传递给 config.py 。在 config.py  内部，它会对每个子配置块（如 `DataConfig`, `ModelConfig` 等）调用 config.py 。
-*   **未定义的键会怎样？**: 它们会被**安全地忽略**，不会报错，也不会被加载到最终的配置对象中。
-    这是在 config.py  （第 51-53 行）中体现的：
+*   **未定义的键会怎样？**: 现在会**直接报错**，不会被悄悄忽略。
+    原因是 `_coerce_dataclass()` 会先计算输入 mapping 中不属于目标 dataclass 的字段：
     ```python
-    for field_name, field_info in cls.__dataclass_fields__.items():
-        if field_name not in value: # 针对配置对象上有的字段，如果字典里没有，跳过（使用 dataclass 默认值）
-            continue
+    field_names = set(cls.__dataclass_fields__)
+    unknown_fields = sorted(set(value) - field_names)
+    if unknown_fields:
+        raise ConfigError(...)
     ```
-    并且，它**只**遍历 `cls.__dataclass_fields__`（即代码中已经定义好的键）。如果你的 JSON 文件里写了一个 `"my_custom_key": "123"`，由于它不在这些预定义的 fields 中，它根本没有机会进入 `kwargs`，直接被丢弃。
+    这样做的好处是配置写错时能尽早暴露。例如把 `"mini_batch_size"` 错写成 `"ppo_mini_batch_size"`，现在会在解析配置阶段失败，而不是默默走默认值。
+    同理，当前没有公开的 `"ray"` 配置块；未来真正接入并行 infra 时，会重新设计明确的 runtime / placement 配置。
 
 ### 问题 2: 必填项与非必填项，以及示例
 
@@ -66,7 +68,7 @@
     // 【必须修改】使用的算法。可选: "ppo", "grpo", "rloo"
     "name": "ppo",
     
-    // 【选填】优势估计方法，如果不填会根据 name 自动推导 (ppo -> gae, grpo -> grpo)
+    // 【选填】优势估计方法，如果不填会根据 name 自动推导 (ppo -> gae, grpo -> grpo, rloo -> rloo)
     "advantage_estimator": "gae",
     
     // 【选填】RL 算法超参数
@@ -82,10 +84,10 @@
     "backend": "hf",
     "device": "cuda:0",
     
-    // 【选填】策略 Loss 和 PPO 参数
+    // 【选填】策略 Loss 和更新参数
     "policy_loss": "ppo_clip",
-    "ppo_mini_batch_size": 4, // 必须能被 micro_batch_size 整除
-    "ppo_epochs": 1,
+    "mini_batch_size": 4, // 必须能被 micro_batch_size 整除
+    "update_epochs": 1,
     "micro_batch_size": 2, // 必须设置以防 OOM
     "clip_ratio": 0.2,
     "clip_ratio_low": null,
@@ -111,12 +113,12 @@
     "backend": "hf",
     "device": "cuda:0",
     
-    // 【选填】是否启用 Critic (PPO 必须 true，GRPO 可以 false)
+    // 【选填】是否启用 Critic (PPO 必须 true，GRPO/RLOO 可以 false)
     "enable": true,
     
     // 【选填】相关超参数，同 Actor
-    "ppo_mini_batch_size": 4,
-    "ppo_epochs": 1,
+    "mini_batch_size": 4,
+    "update_epochs": 1,
     "micro_batch_size": 2,
     "cliprange_value": 0.5,
     "loss_agg_mode": "token-mean",
@@ -146,7 +148,7 @@
       "top_p": 1.0,
       "top_k": -1,
       "do_sample": true,
-      "n": 1 // 如果用 GRPO 模型，这里必须大于 1 (比如 4 或 8)
+      "n": 1 // 如果用 GRPO/RLOO，这里必须大于 1 (比如 4 或 8)
     },
     "validation": {
       "temperature": 0.0,
@@ -189,12 +191,6 @@
     
     "log_optimizer_steps": false,
     "loggers": ["console", "wandb"] // 如果需要 wandb 就加上
-  },
-  "ray": {
-    // 【选填】如果要在多机或复杂的多卡分配环境部署，启用此项
-    "enabled": false,
-    "address": null,
-    "num_cpus": null
   }
 }
 ```

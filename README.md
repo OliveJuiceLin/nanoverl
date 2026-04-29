@@ -1,124 +1,27 @@
 # nanoverl
 
-## What Is Nanoverl
+`nanoverl` is a small reinforcement learning framework for large language model
+research. It is designed to be easy to read, easy to modify, and useful for
+local or single-node PPO/GRPO/RLOO experiments.
 
-`nanoverl` is a small, research-oriented RL framework for large language models.
+It borrows ideas from `verl`, but keeps the core much smaller: one synchronous
+trainer loop, explicit worker and rollout boundaries, typed configs, and
+algorithm plugins that own the RL step semantics.
 
-It is inspired by `verl`, but it deliberately keeps a much smaller surface area:
+## What You Can Do Today
 
-- one clear synchronous trainer loop
-- explicit policy / reference / value / rollout boundaries
-- enough engineering for real PPO / GRPO / RLOO experiments
-- fewer layers that get in the way of reading and modifying the code
+- Run debug PPO and RLOO smoke experiments without heavy dependencies.
+- Train local Hugging Face policy/reference/value workers with HF rollout.
+- Use single-node FSDP workers for the first multi-GPU training slice.
+- Use local HF or FSDP training workers with a thin local `vllm` rollout backend.
+- Add new algorithms through the plugin interface without rewriting the trainer.
 
-This repository is not trying to be a feature-complete replacement for `verl`.
-Its goal is to be a clean RL core that is easy to understand, easy to modify, and still usable for real experiments.
+Built-in algorithms:
 
-## Current Status
-
-The current repository should be understood like this:
-
-- The formal mainline is still a Phase 1 style synchronous RL core.
-- Some Phase 2 usability work is already present, such as algorithm plugins, GRPO / RLOO support, validation summaries, and lightweight debug artifacts.
-- There are already a few thin Phase 3 backend slices, especially single-node FSDP and local `vllm` rollout integration.
-- Not every exposed option should be read as a mature production feature. Some parts are intentionally thin and kept as future extension points.
-
-Today, the most trustworthy path is still:
-
-- typed config
-- stateful dataset / dataloader
-- synchronous trainer
-- explicit policy / reference / value workers
-- algorithm-selected rollout -> reward -> advantage -> update semantics
-- checkpoint / validation / logging on the same main loop
-
-## Repo Map
-
-The repository is organized around the RL training path.
-
-- `nanoverl/algos`
-  - Algorithm plugins plus shared RL math such as policy losses, KL penalties, and advantage estimators.
-- `nanoverl/backends`
-  - Thin backend-specific utilities for Hugging Face, `vllm`, and training backends such as FSDP.
-- `nanoverl/checkpoint`
-  - Local checkpoint save / load helpers.
-- `nanoverl/config.py`
-  - The typed config tree and config validation logic.
-- `nanoverl/core`
-  - Small shared core data structures, mainly `RLBatch`.
-- `nanoverl/data`
-  - Built-in dataset loading and the checkpointable data loader / sampler.
-- `nanoverl/distributed`
-  - Small runtime helpers for `torch.distributed` and future distributed integrations.
-- `nanoverl/logging`
-  - Metrics helpers and tracker backends.
-- `nanoverl/reward`
-  - Reward function loading and reward result shaping.
-- `nanoverl/rollout`
-  - Rollout engine interfaces and concrete backends such as debug, HF, and `vllm`.
-- `nanoverl/trainer`
-  - The main trainer loop, validation helpers, and debug artifact writers.
-- `nanoverl/workers`
-  - Policy / reference / value worker interfaces and implementations.
-- `examples`
-  - Example configs, reward functions, and local experiment helpers.
-- `tests`
-  - Regression tests for the trainer loop, RL math, batch behavior, and backend slices.
-
-## How Training Works
-
-The trainer owns the lifecycle and the selected algorithm owns the RL step semantics.
-
-1. Load a batch from the stateful train loader.
-2. Dispatch the batch to the configured `algorithm.name` plugin.
-3. The algorithm prepares rollout batches, computes rewards, log-probs, values when needed, advantages, and worker updates.
-4. The trainer logs metrics, runs validation, and saves checkpoints on the same driver-owned path.
-
-This ordering is the main thing `nanoverl` tries to preserve and keep readable.
-
-## Supported Paths
-
-The repository currently has these meaningful paths:
-
-- `debug` worker + `debug` rollout
-  - Small smoke-test path with no heavy runtime dependency expectations.
-- local HF policy / reference / value + HF rollout
-  - The clearest fully local real-training path.
-- single-node FSDP workers + HF rollout
-  - The first serious multi-GPU training slice.
-- local HF or FSDP training workers + local `vllm` rollout
-  - A thin rollout backend extension that reuses the same trainer loop.
-- built-in algorithm plugins
-  - `ppo`: critic-backed GAE with clipped PPO policy loss.
-  - `grpo`: actor-only grouped rollout with GRPO advantages and PPO-style clipped policy loss.
-  - `rloo`: actor-only grouped rollout with leave-one-out advantages and REINFORCE policy loss.
-
-## Not Yet Supported
-
-These should be treated as intentionally missing, intentionally thin, or future work:
-
-- async trainers
-- off-policy trainers
-- full Ray worker orchestration
-- multi-turn tool rollout
-- multiple mature rollout runtimes with parity guarantees
-- production-scale serving workflows
-
-## Roadmap Snapshot
-
-The current roadmap can be summarized as:
-
-1. Keep the synchronous RL core small and correct.
-2. Make PPO / GRPO / RLOO research work comfortable on top of the same core contracts.
-3. Add backend breadth only when it materially expands research coverage.
-4. Avoid reintroducing `verl`-style complexity unless it clearly pays for itself.
-
-Near-term priorities are still:
-
-- cleaner core abstractions
-- correct and maintainable RL math
-- reliable single-node training
-- better experiment ergonomics
+- `ppo`: critic-backed GAE with clipped PPO policy loss.
+- `grpo`: actor-only grouped rollout with GRPO advantages and clipped policy loss.
+- `rloo`: actor-only grouped rollout with leave-one-out advantages and
+  REINFORCE policy loss.
 
 ## Quickstart
 
@@ -149,17 +52,93 @@ torchrun --standalone --nproc_per_node=4 -m nanoverl.cli.train_rl --config examp
 Run tests:
 
 ```bash
-python -m unittest discover -s tests -p 'test_*.py'
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-## Maintenance Rule
+## How Training Works
 
-`README.md` is the single long-term project document.
+The trainer owns lifecycle; the algorithm owns RL semantics.
 
-From now on:
+1. The trainer reads a batch from a checkpointable dataloader.
+2. The selected `algorithm.name` plugin runs the RL step.
+3. The algorithm prepares rollout input, calls rollout generation, computes
+   rewards, log-probs, values when needed, advantages, and updates.
+4. After actor updates, the algorithm asks the trainer to sync policy weights
+   into the rollout engine.
+5. The trainer logs metrics, runs validation, and saves checkpoints.
 
-- update this README whenever the repo structure changes
-- update this README whenever the supported capability boundary changes
-- update this README whenever the project phase or roadmap emphasis changes
+Policy sync and checkpointing have separate state paths:
 
-If a reader wants to understand what `nanoverl` is doing, this file should be enough to get oriented quickly.
+- `policy_worker.state_dict()` is checkpoint/resume state.
+- `policy_worker.policy_state_dict()` is the minimal actor -> rollout export.
+- `rollout_engine.state_dict()` is lightweight rollout-side state and does not
+  save actor model weights.
+
+Checkpoints are versioned and structured into `trainer_state`, `loader_state`,
+`worker_state`, `rollout_state`, and `config`.
+
+## Config Basics
+
+Choose an algorithm with:
+
+```json
+{
+  "algorithm": {
+    "name": "ppo"
+  }
+}
+```
+
+Actor and critic update fields use algorithm-neutral names:
+
+- `mini_batch_size`
+- `update_epochs`
+- `micro_batch_size`
+
+There is no public `ray` config section today. Parallel runtime and placement
+settings will be added when the corresponding infra is implemented.
+
+Unknown config fields fail fast instead of being ignored.
+
+## Repository Map
+
+- `nanoverl/algos`: algorithm plugins, advantage estimators, policy losses, KL
+  helpers, and value loss.
+- `nanoverl/backends`: backend-specific helpers for Hugging Face, FSDP, and
+  `vllm`.
+- `nanoverl/checkpoint`: local checkpoint manager.
+- `nanoverl/config.py`: typed config tree and validation.
+- `nanoverl/core`: shared data structures such as `RLBatch`.
+- `nanoverl/data`: JSON dataset and stateful dataloader.
+- `nanoverl/distributed`: current `torch.distributed` runtime helper.
+- `nanoverl/logging`: metric and tracker utilities.
+- `nanoverl/reward`: reward function loading and reward result handling.
+- `nanoverl/rollout`: rollout interface, backend registry, rollout engines, and
+  policy sync helper.
+- `nanoverl/trainer`: synchronous trainer, validation, checkpoint orchestration,
+  and artifact writing.
+- `nanoverl/workers`: policy/reference/value interfaces, backend registry, and
+  worker implementations.
+- `examples`: runnable configs and reward/data helpers.
+- `tests`: regression tests for the core trainer, algorithms, config, checkpoint,
+  and backend slices.
+
+## Current Limits
+
+`nanoverl` is intentionally small. These are not mature supported paths yet:
+
+- async trainer
+- off-policy trainer
+- full worker-group orchestration
+- production-scale serving
+- mature multi-runtime rollout parity
+- packed-batch training path
+
+The next development phase can start adding real parallel infra: worker groups,
+placement/runtime config, parameter sync management, and candidate integrations
+inspired by `nanoRLHF` components such as `nanovllm`, `nanotron`, and `nanoray`.
+
+## For Developers
+
+`README.md` is for users of the project. Development context, design principles,
+current phase information, and reference-project notes live in `AGENTS.md`.

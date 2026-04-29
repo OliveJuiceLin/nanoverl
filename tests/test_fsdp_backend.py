@@ -10,6 +10,7 @@ from pathlib import Path
 from nanoverl.config import TrainerConfig
 from nanoverl.core.batch import RLBatch
 from nanoverl.rollout.base import SamplingParams
+from nanoverl.rollout.sync import PolicySyncer
 from nanoverl.trainer import build_trainer
 
 try:  # pragma: no cover - exercised only when optional deps are installed
@@ -129,8 +130,8 @@ class FSDPBackendTest(unittest.TestCase):
                 },
                 "actor": {
                     "backend": "fsdp",
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 2,
+                    "update_epochs": 1,
                     "micro_batch_size": 1,
                     "clip_ratio": 0.2,
                     "lr": 1e-4,
@@ -138,8 +139,8 @@ class FSDPBackendTest(unittest.TestCase):
                 "critic": {
                     "backend": "fsdp",
                     "enable": True,
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 2,
+                    "update_epochs": 1,
                     "micro_batch_size": 1,
                     "cliprange_value": 0.5,
                     "lr": 1e-4,
@@ -172,8 +173,8 @@ class FSDPBackendTest(unittest.TestCase):
             config = TrainerConfig.from_dict(
                 {
                     "model": {"path": str(model_dir), "tokenizer_path": str(model_dir), "dtype": "float32"},
-                    "actor": {"backend": "fsdp", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
-                    "critic": {"backend": "fsdp", "ppo_mini_batch_size": 2, "micro_batch_size": 1},
+                    "actor": {"backend": "fsdp", "mini_batch_size": 2, "micro_batch_size": 1},
+                    "critic": {"backend": "fsdp", "mini_batch_size": 2, "micro_batch_size": 1},
                     "reference": {"backend": "fsdp", "enable": True},
                     "rollout": {"backend": "hf", "response_length": 4},
                 }
@@ -184,6 +185,14 @@ class FSDPBackendTest(unittest.TestCase):
             policy_worker = FSDPPolicyWorker(config.model, config.actor)
             reference_worker = FSDPReferenceWorker(config.model, config.reference)
             value_worker = FSDPValueWorker(config.model, config.critic)
+            checkpoint_state = policy_worker.state_dict()
+            export_state = policy_worker.policy_state_dict()
+            self.assertIn("optimizer_state", checkpoint_state)
+            self.assertIn("update_steps", checkpoint_state)
+            self.assertIn("model_state", export_state)
+            self.assertNotIn("optimizer_state", export_state)
+            self.assertNotIn("update_steps", export_state)
+
             log_probs = policy_worker.compute_log_probs(batch)
             ref_log_probs = reference_worker.compute_log_probs(batch)
             values = value_worker.compute_values(batch)
@@ -194,7 +203,7 @@ class FSDPBackendTest(unittest.TestCase):
 
             rollout = HFRolloutEngine(config.model, config.data, config.rollout)
             before = rollout.generate(RLBatch(non_tensor={"prompt": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
-            rollout.sync_policy(policy_worker.state_dict())
+            PolicySyncer().sync(policy_worker, rollout, "test")
             after = rollout.generate(RLBatch(non_tensor={"prompt": ["say yes"]}), SamplingParams(do_sample=False, temperature=0.0, n=1))
             self.assertEqual(len(before.batch["responses"][0]), len(after.batch["responses"][0]))
             self.assertLess(before.meta["policy_sync_steps"], after.meta["policy_sync_steps"])

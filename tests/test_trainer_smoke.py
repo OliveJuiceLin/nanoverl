@@ -32,15 +32,15 @@ class TrainerSmokeTest(unittest.TestCase):
                 },
                 "actor": {
                     "backend": "debug",
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 2,
+                    "update_epochs": 1,
                     "clip_ratio": 0.2,
                 },
                 "critic": {
                     "backend": "debug",
                     "enable": True,
-                    "ppo_mini_batch_size": 2,
-                    "ppo_epochs": 1,
+                    "mini_batch_size": 2,
+                    "update_epochs": 1,
                 },
                 "reference": {
                     "backend": "debug",
@@ -85,6 +85,17 @@ class TrainerSmokeTest(unittest.TestCase):
                 self.assertIn("val/reward_mean", val_metrics)
                 self.assertEqual(trainer.global_step, 2)
                 saved_loader_state = trainer.train_loader.state_dict()
+                payload = trainer.checkpoint_manager.load_latest()
+                self.assertEqual(payload["checkpoint_version"], 2)
+                self.assertEqual(
+                    set(payload),
+                    {"checkpoint_version", "trainer_state", "loader_state", "worker_state", "rollout_state", "config"},
+                )
+                self.assertEqual(payload["trainer_state"]["global_step"], 2)
+                self.assertIn("train", payload["loader_state"])
+                self.assertIn("policy", payload["worker_state"])
+                self.assertNotIn("policy_state", payload)
+                self.assertNotIn("policy_version", payload["rollout_state"])
             finally:
                 trainer.close()
 
@@ -96,6 +107,24 @@ class TrainerSmokeTest(unittest.TestCase):
                     resumed_trainer.train_loader.state_dict()["sampler"]["position"],
                     saved_loader_state["sampler"]["position"],
                 )
+            finally:
+                resumed_trainer.close()
+
+    def test_old_flat_checkpoint_payload_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "train.jsonl"
+            self._write_jsonl(dataset_path, [{"prompt": "say yes"}, {"prompt": "say no"}])
+            config = self._make_config(tmpdir, dataset_path)
+            trainer = build_trainer(config)
+            try:
+                trainer.checkpoint_manager.save(0, {"global_step": 0})
+            finally:
+                trainer.close()
+
+            resumed_trainer = build_trainer(config)
+            try:
+                with self.assertRaisesRegex(ValueError, "Unsupported checkpoint payload version"):
+                    resumed_trainer.load_checkpoint()
             finally:
                 resumed_trainer.close()
 
